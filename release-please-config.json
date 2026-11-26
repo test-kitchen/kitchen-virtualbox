@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "package-name": "kitchen-virtualbox",
+      "release-type": "ruby",
+      "version-file": "lib/kitchen/driver/virtualbox_version.rb",
+      "initial-version": "0.1.0",
+      "include-component-in-tag": false
+    }
+  }
+}

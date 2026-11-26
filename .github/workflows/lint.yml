@@ -1,0 +1,14 @@
+---
+name: Lint and unit tests
+
+"on":
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-unit:
+    uses: test-kitchen/.github/.github/workflows/lint-unit.yml@main
+    with:
+      bundle_without: development:smoke

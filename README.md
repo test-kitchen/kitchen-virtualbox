@@ -29,10 +29,33 @@ already has credentials, configure `transport.ssh_key` or
 The `vboxmanage` driver option can point to a binary outside `PATH`.
 
 After adding a provisioner and suite, run `bundle exec kitchen test` from the
-Kitchen project. This driver requires the shared box catalog and cache API in
-Test Kitchen. The development Gemfile pins a compatible Test Kitchen revision.
+Kitchen project. This driver requires Test Kitchen 4.2 or newer for the
+shared box catalog and cache API.
 Set `TEST_KITCHEN_PATH` to use another compatible local checkout.
 
 Catalog-backed boxes are copied to the local Kitchen cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
+
+## Apache smoke tests
+
+Mount the NAS or set `KITCHEN_BOX_MANIFEST` to a manifest containing the
+pinned Bento Ubuntu 24.04 box for your platform. Alternatively, set
+`KITCHEN_VIRTUALBOX_UBUNTU_BOX` to a local box archive. Install Cinc Workstation
+with `cinc-cli` on `PATH` for the Cinc suite.
+
+Run these commands from the driver checkout:
+
+```sh
+bundle install
+bundle exec ruby examples/apache2/run.rb test cinc --destroy always
+bundle exec ruby examples/apache2/run.rb test puppet --destroy always
+bundle exec ruby examples/apache2/run.rb test ansible --destroy always
+```
+
+Each suite creates its own VM, provisions Apache, verifies the service is
+enabled and returns HTTP 200, and destroys the VM. Cinc and Ansible also
+check that a second apply makes no changes. Puppet and Ansible install their
+runtimes from the Ubuntu package repositories before applying the examples.
+
+Set `VBOXMANAGE` if the VirtualBox CLI is outside `PATH`.
