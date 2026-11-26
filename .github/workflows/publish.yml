@@ -1,0 +1,74 @@
+---
+name: release-please
+
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gem-release
+
+jobs:
+  release-please:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+
+      - name: Verify published Test Kitchen supports the shared box API
+        run: |
+          gem install test-kitchen --no-document
+          ruby <<'RUBY'
+          driver = File.basename(Dir["kitchen-*.gemspec"].fetch(0), ".gemspec")
+          spec = Gem::Specification.load("#{driver}.gemspec")
+          dependency = spec.runtime_dependencies.find { |entry| entry.name == "test-kitchen" }
+          gem "test-kitchen", dependency.requirement
+          require "kitchen"
+          require "kitchen/box/local_archive"
+          require "kitchen/box/source"
+          require "kitchen/box/ssh_bootstrap"
+          if dependency.match?("test-kitchen", "4.1.5")
+            abort "Update the gemspec to require the first Test Kitchen release with the shared box API."
+          end
+          RUBY
+
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          token: ${{ secrets.PORTER_GITHUB_TOKEN }}
+
+      - name: Checkout release
+        uses: actions/checkout@v7
+        if: steps.release.outputs.release_created == 'true'
+        with:
+          ref: ${{ steps.release.outputs.tag_name }}
+          persist-credentials: false
+
+      - name: Build and publish to GitHub Packages
+        uses: actionshub/publish-gem-to-github@main
+        if: steps.release.outputs.release_created == 'true'
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Build and publish to RubyGems
+        uses: actionshub/publish-gem-to-rubygems@main
+        if: steps.release.outputs.release_created == 'true'
+        with:
+          token: ${{ secrets.RUBYGEMS_API_KEY }}

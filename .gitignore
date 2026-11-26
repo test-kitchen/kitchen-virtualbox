@@ -2,3 +2,7 @@
 /.kitchen/
 /Gemfile.lock
 /*.gem
+**/.kitchen/
+**/kitchen.local.yml
+**/.kitchen.local.yml
+**/Policyfile.lock.json
