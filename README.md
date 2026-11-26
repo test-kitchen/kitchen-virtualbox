@@ -29,8 +29,8 @@ already has credentials, configure `transport.ssh_key` or
 The `vboxmanage` driver option can point to a binary outside `PATH`.
 
 After adding a provisioner and suite, run `bundle exec kitchen test` from the
-Kitchen project. This driver requires the shared box catalog and cache API in
-Test Kitchen. The development Gemfile pins a compatible Test Kitchen revision.
+Kitchen project. This driver requires Test Kitchen 4.2 or newer for the
+shared box catalog and cache API.
 Set `TEST_KITCHEN_PATH` to use another compatible local checkout.
 
 Catalog-backed boxes are copied to the local Kitchen cache. Use
