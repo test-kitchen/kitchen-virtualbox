@@ -12,3 +12,16 @@ jobs:
     uses: test-kitchen/.github/.github/workflows/lint-unit.yml@main
     with:
       bundle_without: development:smoke
+
+  smoke-config:
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_WITHOUT: development:cookstyle
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: Check the Apache smoke suites
+        run: bundle exec ruby examples/apache2/check.rb virtualbox ubuntu-2404-virtualbox 'sudo '
