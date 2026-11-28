@@ -146,17 +146,19 @@ module Kitchen
 
       def ensure_running(uuid, state)
         info = vm_info(uuid)
-        forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
         if info.fetch("VMState") == "running"
-          rule = forwarding.find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
+          rule = forwarding_rules(info).find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
           raise ActionFailed, "Running VirtualBox VM is missing its Kitchen SSH forwarding rule" unless rule
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
           # Registered-source clones use the Kitchen token as their VM UUID.
-          isolate_clone(uuid, info) if uuid == state[:virtualbox_token]
-          forwarding.each do |rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{rule.split(",").first}")
+          if uuid == state[:virtualbox_token]
+            isolate_clone(uuid, info)
+            info = vm_info(uuid)
+          end
+          forwarding_rules(info).each do |rule|
+            vbox("modifyvm", uuid, "--nat-pf1", "delete", rule.split(",").first)
           end
           TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
           vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}")
@@ -165,9 +167,13 @@ module Kitchen
         state[:hostname] = "127.0.0.1"
       end
 
+      def forwarding_rules(info)
+        info.select { |key, _| key.start_with?("Forwarding(") }.values
+      end
+
       def isolate_clone(uuid, info)
         options = %w{--vrde off --clipboard-mode disabled --drag-and-drop disabled
-          --usb-ohci off --usb-ehci off --usb-xhci off --nic-trace1 off}
+          --usb-ohci off --usb-ehci off --usb-xhci off --nic-trace1 off --nic1 nat --cable-connected1 on}
         info.each do |key, value|
           if (adapter = /\Anic([0-9]+)\z/.match(key))
             options.push("--#{key}", "none") if adapter[1].to_i > 1 && value != "none"

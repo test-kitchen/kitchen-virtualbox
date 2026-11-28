@@ -42,7 +42,7 @@ class RegisteredSourceTest < Minitest::Test
 
   def test_create_runs_a_full_clone_and_destroy_preserves_the_source
     source = registry.fetch(SOURCE)
-    source.merge!("nic2" => "nat", "share" => "inherited-share")
+    source.merge!("nic2" => "nat", "share" => "inherited-share", "forwarding1" => "web", "forwarding2" => "other-web", "cable1" => "off")
     File.write(@registry, JSON.generate(SOURCE => source))
 
     assert_kitchen "create"
@@ -52,6 +52,7 @@ class RegisteredSourceTest < Minitest::Test
     assert_equal SOURCE, vm.fetch("source")
     assert_equal "none", vm.fetch("nic2")
     refute vm.key?("share")
+    refute vm.key?("forwarding1")
     assert File.directory?(File.join(@root, ".kitchen", "virtualbox-#{uuid}"))
     assert_kitchen "destroy"
     assert_equal({ SOURCE => source }, registry)
