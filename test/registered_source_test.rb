@@ -6,6 +6,7 @@ require "json"
 require "minitest/autorun"
 require "open3"
 require "rbconfig"
+require "socket"
 require "tmpdir"
 
 class RegisteredSourceTest < Minitest::Test
@@ -60,6 +61,20 @@ class RegisteredSourceTest < Minitest::Test
     refute File.exist?(File.join(@root, ".kitchen", "virtualbox-#{uuid}"))
   end
 
+  def test_full_clone_applies_network_and_hardware_overrides_and_reuses_them
+    source = registry.fetch(SOURCE).merge("nic2" => "nat", "nic3" => "bridged",
+      "forwarding1" => "inherited-ssh", "forwarding2" => "inherited-web", "cpus" => "1", "memory" => "1024")
+    File.write(@registry, JSON.generate(SOURCE => source))
+
+    configure_clone_network
+    assert_match(%r{ip -4 address replace 192[.]0[.]2[.]31/24}, assert_kitchen("create"))
+    assert_kitchen "create"
+    assert_clone_network
+
+    assert_kitchen "destroy"
+    assert_equal({ SOURCE => source }, registry)
+  end
+
   def test_running_source_is_rejected_before_cloning
     source_state("running")
     output, status = kitchen("create")
@@ -71,10 +86,13 @@ class RegisteredSourceTest < Minitest::Test
 
   def test_converge_and_destroy_a_linked_clone_without_deleting_shared_media
     source = configure_linked_clone
+    configure_clone_network
     root_alias = File.join(@root, "alias")
     File.symlink(@root, root_alias)
     File.open(@configuration, "a") { |file| file.puts "kitchen:\n  kitchen_root: #{root_alias}" }
-    assert_kitchen "converge"
+    assert_match(%r{ip -4 address replace 192[.]0[.]2[.]31/24}, assert_kitchen("converge"))
+    assert_kitchen "create"
+    assert_clone_network
     uuid, clone = registry.find { |id, _| id != SOURCE }
     assert_equal "clean template", clone.fetch("linked_snapshot")
     assert_equal "running", clone.fetch("state")
@@ -192,12 +210,38 @@ class RegisteredSourceTest < Minitest::Test
     File.write(@configuration, File.read(@configuration).sub(
       "source_vm: Disposable source", "source_vm: Disposable source\n  source_snapshot: clean template"
     ))
-    source = registry.fetch(SOURCE).merge("snapshot" => "clean template")
+    source = registry.fetch(SOURCE).merge("snapshot" => "clean template", "nic3" => "hostonly")
     File.write(@registry, JSON.generate(SOURCE => source))
     source_disk = File.join(@root, "source.vmdk")
     File.write(source_disk, "")
     File.write(File.join(@root, "disks.json"), JSON.generate(SOURCE => [source_disk, "base"]))
     source
+  end
+
+  def configure_clone_network
+    @forward_port = TCPServer.open("127.0.0.1", 0) { |socket| socket.addr[1] }
+    settings = <<~YAML
+      insert_key: false
+      cpus: 2
+      memory: 2048
+      port_forward:
+        host_port: #{@forward_port}
+        guest_port: 8080
+      private_network: clone-test
+      private_address: 192.0.2.31/24
+    YAML
+    File.write(@configuration, File.read(@configuration).sub("  insert_key: false\n", settings.lines.map { |line| "  #{line}" }.join))
+  end
+
+  def assert_clone_network
+    clone = registry.find { |id, _| id != SOURCE }.last
+    assert_equal %w{intnet clone-test none 2 2048}, clone.values_at("nic2", "intnet2", "nic3", "cpus", "memory")
+    refute clone.key?("forwarding1")
+    forwards = clone.fetch("forwards")
+    assert_equal 2, forwards.length
+    ssh, forward = forwards
+    assert_match(/\Akitchen-ssh,tcp,127[.]0[.]0[.]1,\d+,,22\z/, ssh)
+    assert_equal "kitchen-forward,tcp,127.0.0.1,#{@forward_port},,8080", forward
   end
 
   def source_state(state)
@@ -220,5 +264,6 @@ class RegisteredSourceTest < Minitest::Test
   def assert_kitchen(action)
     output, status = kitchen(action)
     assert status.success?, output
+    output
   end
 end
