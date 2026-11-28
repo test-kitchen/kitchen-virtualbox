@@ -1,4 +1,9 @@
-desc "Verify the VirtualBox driver through Test Kitchen"
+require "rake/testtask"
+
+Rake::TestTask.new(:test) do |task|
+  task.pattern = "spec/**/*_spec.rb"
+end
+
 task :test do
   ruby "-Ilib", "-e", 'require "kitchen/driver/virtualbox"'
   ruby "test/winrm_test.rb", "negotiate", "http", "5985"
