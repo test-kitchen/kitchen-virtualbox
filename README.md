@@ -79,6 +79,45 @@ with that support. Use `kitchen box doctor --checksum` to download and verify
 remote entries. Filter by name, version, provider and architecture to check
 a specific archive.
 
+## Networking
+
+By default, Kitchen uses a random loopback TCP port to reach the guest over SSH.
+To expose another guest TCP service on the host and connect guests on a private
+VirtualBox internal network, configure either or both options:
+
+```yaml
+driver:
+  name: virtualbox
+  port_forward:
+    host_port: 18080
+    guest_port: 8080
+  private_network: project-test
+  private_address: 192.0.2.31/24
+```
+
+- `port_forward` binds one additional TCP port on `127.0.0.1`. Use a free host
+  port for each VM that forwards a service. The service must listen on the
+  guest's NAT interface.
+- `private_network` attaches a second adapter to a VirtualBox internal
+  network. Other VMs attached to the same named network can communicate. Pick
+  a project-specific name and give each guest a distinct address on a subnet
+  separate from the guest's NAT subnet.
+- `private_address` requires `private_network` and assigns an IPv4 CIDR address
+  to that adapter. Kitchen applies it over SSH after boot. It requires a Linux
+  guest with `ip` and either root SSH access or passwordless `sudo` for `ip`.
+  The address is runtime-only. After an independent guest reboot, rerun
+  `kitchen create` to restore it. With the address omitted, the guest must
+  already configure its private adapter.
+
+SSH continues to use the first adapter and its loopback NAT forward.
+By default, secondary adapters retain their imported settings. With
+`private_network` configured, Kitchen replaces adapter 2's attachment and
+disables adapters 3–8 so inherited connections cannot bypass the private network.
+To change private networking for an existing VM or change forwarding while it
+is running, run `kitchen destroy` followed by `kitchen create`. Bridged
+networking, host-only adapters, IPv6 configuration and UDP forwarding are
+unsupported.
+
 ## Status and diagnostics
 
 Run `kitchen list --live` to see the state reported by VirtualBox for each
