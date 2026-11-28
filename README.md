@@ -28,6 +28,13 @@ already has credentials, configure `transport.ssh_key` or
 `transport.password`. Set `insert_key: false` to leave key setup to the image.
 The `vboxmanage` driver option can point to a binary outside `PATH`.
 
+Set `driver.cpus` to the number of virtual processors and `driver.memory` to
+guest RAM in MB when importing a new VM. Both settings accept positive
+integers within VirtualBox 7.2's limits (1–64 CPUs and 4–2,097,152 MB).
+Omit either setting to retain the corresponding value from the image.
+Run `kitchen destroy` followed by
+`kitchen create` to change the hardware of an existing Kitchen VM.
+
 After adding a provisioner and suite, run `bundle exec kitchen test` from the
 Kitchen project. This driver requires Test Kitchen 4.2 or newer for the
 shared box catalog and cache API.
@@ -36,6 +43,45 @@ Set `TEST_KITCHEN_PATH` to use another compatible local checkout.
 Catalog-backed boxes are copied to the local Kitchen cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
+
+## Networking
+
+By default, Kitchen uses a random loopback TCP port to reach the guest over SSH.
+To expose another guest TCP service on the host and connect guests on a private
+VirtualBox internal network, configure either or both options:
+
+```yaml
+driver:
+  name: virtualbox
+  port_forward:
+    host_port: 18080
+    guest_port: 8080
+  private_network: project-test
+  private_address: 192.0.2.31/24
+```
+
+- `port_forward` binds one additional TCP port on `127.0.0.1`. Use a free host
+  port for each VM that forwards a service. The service must listen on the
+  guest's NAT interface.
+- `private_network` attaches a second adapter to a VirtualBox internal
+  network. Other VMs attached to the same named network can communicate. Pick
+  a project-specific name and give each guest a distinct address on a subnet
+  separate from the guest's NAT subnet.
+- `private_address` requires `private_network` and assigns an IPv4 CIDR address
+  to that adapter. Kitchen applies it over SSH after boot. It requires a Linux
+  guest with `ip` and either root SSH access or passwordless `sudo` for `ip`.
+  The address is runtime-only. After an independent guest reboot, rerun
+  `kitchen create` to restore it. With the address omitted, the guest must
+  already configure its private adapter.
+
+SSH continues to use the first adapter and its loopback NAT forward.
+By default, secondary adapters retain their imported settings. With
+`private_network` configured, Kitchen replaces adapter 2's attachment and
+disables adapters 3–8 so inherited connections cannot bypass the private network.
+To change private networking for an existing VM or change forwarding while it
+is running, run `kitchen destroy` followed by `kitchen create`. Bridged
+networking, host-only adapters, IPv6 configuration and UDP forwarding are
+unsupported.
 
 ## Packaging an instance
 
@@ -52,6 +98,14 @@ that you placed in the guest or inherited from the input box. The driver
 imports new VM disks as VDI. Packaging requires standalone VDI disks attached
 only to the source VM and a VM without connected optical media or shared
 folders.
+
+## Status and diagnostics
+
+Run `kitchen list --live` to see the state reported by VirtualBox for each
+managed VM. Add `--probe` to check transport connectivity as well.
+Run `kitchen doctor` to check host access and the configured VM source before
+creating an instance. These checks read the provider and local configuration
+without starting or modifying VMs.
 
 ## Apache smoke tests
 
