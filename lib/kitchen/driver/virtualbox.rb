@@ -23,6 +23,7 @@ module Kitchen
       default_config :box_manifest
       default_config :box_cache
       default_config :source_vm
+      default_config :source_snapshot
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
 
@@ -30,12 +31,16 @@ module Kitchen
 
       def create(state)
         source = config[:source_vm]
+        snapshot = config[:source_snapshot]
+        unless snapshot.nil? || (snapshot.is_a?(String) && !snapshot.strip.empty? && source && config[:box].nil?)
+          raise ActionFailed, "Set driver.source_snapshot to an existing snapshot name or UUID with driver.source_vm and without driver.box"
+        end
         unless source.nil? || (source.is_a?(String) && !source.strip.empty? && config[:box].nil?)
           raise ActionFailed, "Set driver.source_vm to a registered VirtualBox VM name or UUID without driver.box"
         end
 
         prepare_state(state)
-        uuid = registered_uuid(state) || (source ? clone_vm(source, state) : import_vm(state))
+        uuid = registered_uuid(state) || (source ? clone_vm(source, snapshot, state) : import_vm(state))
         state[:virtualbox_uuid] = uuid
         checkpoint(state)
         ensure_running(uuid, state)
@@ -54,14 +59,31 @@ module Kitchen
           when "saved"
             vbox("discardstate", uuid)
           end
-          vbox("unregistervm", uuid, "--delete")
+          # Linked clones share a disk chain with their source. Delete only files we own.
+          options = state[:virtualbox_linked_clone] ? [] : ["--delete"]
+          vbox("unregistervm", uuid, *options)
         end
         directory = vm_directory(state)
+        close_linked_clone_media(directory) if state[:virtualbox_linked_clone] && File.directory?(directory) && !File.symlink?(directory)
         FileUtils.remove_entry_secure(directory) if File.exist?(directory)
         release_box_source(state)
       end
 
       private
+
+      def close_linked_clone_media(directory)
+        prefix = "#{File.realpath(directory)}/"
+        vbox("list", "hdds").split(/\n\s*\n/).reverse_each do |entry|
+          path = entry[/^Location:[ \t]+(.+)$/, 1]
+          next unless path&.start_with?(prefix)
+          next if File.exist?(path) && File.realpath(path) != path
+
+          uuid = entry[/^UUID:[ \t]+([0-9a-f-]+)$/, 1]
+          raise ActionFailed, "VirtualBox did not report a UUID for clone disk #{path}" unless uuid
+
+          vbox("closemedium", "disk", uuid)
+        end
+      end
 
       def prepare_state(state)
         return if state[:virtualbox_token]
@@ -98,7 +120,7 @@ module Kitchen
         end
       end
 
-      def clone_vm(source, state)
+      def clone_vm(source, snapshot, state)
         vms = registered_vms
         source_vm = vms.find { |_, uuid| uuid.casecmp?(source) } || vms.find { |name, _| name == source }
         raise ActionFailed, "VirtualBox source VM is not registered: #{source}" unless source_vm
@@ -110,14 +132,21 @@ module Kitchen
         end
 
         clone_uuid = state.fetch(:virtualbox_token)
-        if state[:virtualbox_uuid] != clone_uuid
-          state[:virtualbox_uuid] = clone_uuid
-          checkpoint(state)
-        end
+        state[:virtualbox_uuid] = clone_uuid
+        state[:virtualbox_linked_clone] = true if snapshot
+        checkpoint(state)
         directory = vm_directory(state)
         FileUtils.mkdir_p(directory, mode: 0o700)
-        vbox("clonevm", source_uuid, "--mode", "machine", "--name", state.fetch(:virtualbox_name),
-          "--uuid", clone_uuid, "--basefolder", directory, "--register")
+        clone_options = snapshot ? ["--options=Link", "--snapshot=#{snapshot}"] : []
+        begin
+          vbox("clonevm", source_uuid, "--mode", "machine", "--name", state.fetch(:virtualbox_name),
+            "--uuid", clone_uuid, "--basefolder", directory, "--register", *clone_options)
+        rescue ActionFailed => e
+          raise unless snapshot
+
+          raise ActionFailed, "Could not link VirtualBox snapshot #{snapshot.inspect} on #{source.inspect}. " \
+            "Choose an existing snapshot taken while the source was powered off. #{e.message}"
+        end
         registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
       end
 
@@ -146,6 +175,10 @@ module Kitchen
 
       def ensure_running(uuid, state)
         info = vm_info(uuid)
+        if state[:virtualbox_linked_clone] && info.fetch("VMState") == "saved"
+          raise ActionFailed, "Linked clone has a saved runtime state. Run kitchen destroy and choose a snapshot taken while the source was powered off."
+        end
+
         if info.fetch("VMState") == "running"
           rule = forwarding_rules(info).find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
           raise ActionFailed, "Running VirtualBox VM is missing its Kitchen SSH forwarding rule" unless rule

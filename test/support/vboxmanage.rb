@@ -5,14 +5,20 @@ require "json"
 
 registry_path = ENV.fetch("VBOX_TEST_REGISTRY")
 registry = JSON.parse(File.read(registry_path))
+disks_path = File.join(File.dirname(registry_path), "disks.json")
 command, target, *options = ARGV
 uuid = registry.key?(target) ? target : registry.find { |_, vm| vm.fetch("name") == target }&.first
 
 case command
 when "list"
-  abort "unexpected list target" unless target == "vms"
+  abort "unexpected list target" unless %w{vms hdds}.include?(target)
 
-  registry.each { |id, vm| puts %("#{vm.fetch("name")}" {#{id}}) }
+  registry.each { |id, vm| puts %("#{vm.fetch("name")}" {#{id}}) } if target == "vms"
+  if target == "hdds"
+    JSON.parse(File.read(disks_path)).each do |id, path|
+      puts "UUID: #{id}", "Location: #{path}", ""
+    end
+  end
 when "showvminfo"
   vm = registry.fetch(uuid)
   puts %{UUID="#{uuid}"}
@@ -26,14 +32,29 @@ when "showvminfo"
   puts %{SharedFolderNameMachineMapping1="#{vm.fetch("share")}"} if vm.key?("share")
 when "clonevm"
   abort "attempted to clone a running source" unless registry.fetch(uuid).fetch("state") == "poweroff"
-  abort "expected a full registered clone" unless options.include?("--register") && !options.include?("--options") &&
+  abort "expected a registered clone" unless options.include?("--register") &&
     options.each_cons(2).include?(%w{--mode machine})
+  if !registry.fetch(uuid)["snapshot"] && options.any? { |option| option.start_with?("--options") }
+    abort "expected a full clone without options"
+  end
 
   clone_uuid = options.fetch(options.index("--uuid") + 1)
   abort "clone already registered" if registry.key?(clone_uuid)
 
   name = options.fetch(options.index("--name") + 1)
   registry[clone_uuid] = registry.fetch(uuid).merge("name" => name, "source" => uuid)
+  if (snapshot = registry.fetch(uuid)["snapshot"])
+    abort "expected a linked clone of the explicit snapshot" unless
+      options.include?("--options=Link") && options.include?("--snapshot=#{snapshot}")
+    registry[clone_uuid]["linked_snapshot"] = snapshot
+    directory = File.realpath(options.fetch(options.index("--basefolder") + 1))
+    clone_disk = File.join(directory, "clone.vmdk")
+    File.write(clone_disk, "")
+    source_disk = File.join(File.dirname(registry_path), "source.vmdk")
+    File.write(disks_path, JSON.generate(uuid => source_disk, clone_uuid => clone_disk))
+  else
+    abort "expected a full clone" if options.include?("--options=Link")
+  end
   File.write(registry_path, JSON.generate(registry))
   failure_marker = File.join(File.dirname(registry_path), "fail_clone_once")
   if File.exist?(failure_marker)
@@ -70,7 +91,21 @@ when "startvm"
 when "controlvm"
   registry.fetch(uuid)["state"] = "poweroff"
 when "unregistervm"
+  abort "linked clone teardown must preserve shared media" if registry.fetch(uuid)["linked_snapshot"] && options.include?("--delete")
   registry.delete(uuid)
+when "closemedium"
+  abort "expected a disk" unless target == "disk"
+
+  failure_marker = File.join(File.dirname(registry_path), "fail_close_once")
+  if File.exist?(failure_marker)
+    File.delete(failure_marker)
+    abort "simulated disk close failure"
+  end
+
+  disks = JSON.parse(File.read(disks_path))
+  abort "unknown disk" unless disks.delete(options.fetch(0))
+
+  File.write(disks_path, JSON.generate(disks))
 else
   abort "unexpected VBoxManage command #{ARGV.inspect}"
 end

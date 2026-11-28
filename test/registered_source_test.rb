@@ -68,6 +68,45 @@ class RegisteredSourceTest < Minitest::Test
     assert_equal({ SOURCE => { "name" => "Disposable source", "state" => "running" } }, registry)
   end
 
+  def test_converge_and_destroy_a_linked_clone_without_deleting_shared_media
+    File.write(@configuration, File.read(@configuration).sub(
+      "source_vm: Disposable source", "source_vm: Disposable source\n  source_snapshot: clean template"
+    ))
+    source = registry.fetch(SOURCE).merge("snapshot" => "clean template")
+    File.write(@registry, JSON.generate(SOURCE => source))
+
+    assert_kitchen "converge"
+    uuid, clone = registry.find { |id, _| id != SOURCE }
+    assert_equal "clean template", clone.fetch("linked_snapshot")
+    assert_equal "running", clone.fetch("state")
+    disks = File.join(@root, "disks.json")
+    assert_equal [SOURCE, uuid], JSON.parse(File.read(disks)).keys
+    File.write(File.join(@root, "fail_close_once"), "")
+    output, status = kitchen("destroy")
+    refute status.success?, output
+    assert_match(/simulated disk close failure/, output)
+    assert_equal({ SOURCE => source }, registry)
+    assert_equal [SOURCE, uuid], JSON.parse(File.read(disks)).keys
+    assert File.directory?(File.join(@root, ".kitchen", "virtualbox-#{uuid}"))
+
+    assert_kitchen "destroy"
+    assert_equal({ SOURCE => source }, registry)
+    assert_equal [SOURCE], JSON.parse(File.read(disks)).keys
+    refute File.exist?(File.join(@root, ".kitchen", "virtualbox-#{uuid}"))
+  end
+
+  def test_snapshot_requires_a_registered_source
+    File.write(@configuration, File.read(@configuration).sub(
+      "source_vm: Disposable source", "source_snapshot: clean template"
+    ))
+    before = registry
+
+    output, status = kitchen("create")
+    refute status.success?, output
+    assert_match(/source_snapshot.*with driver.source_vm and without driver.box/, output)
+    assert_equal before, registry
+  end
+
   def test_retry_recovers_a_clone_registered_before_the_command_failed
     File.write(@configuration, File.read(@configuration).sub("source_vm: Disposable source", "source_vm: #{SOURCE}"))
     File.write(File.join(@root, "fail_clone_once"), "")
