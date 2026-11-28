@@ -100,6 +100,7 @@ module Kitchen
           manifest = File.expand_path(manifest, config[:kitchen_root]) unless manifest.to_s.empty?
           catalog = Box::Catalog.new(manifest)
           entry = catalog.find(name: box[:name], version: box[:version], provider: "virtualbox")
+          Box::Cache.new(config[:box_cache]).validate_destination(catalog, entry)
           catalog.verify(entry)
         else
           raise ActionFailed, "Set driver.box to a local path or a map with name and an exact version" unless box.is_a?(String) && !box.empty?

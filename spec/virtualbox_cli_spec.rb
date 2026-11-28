@@ -87,22 +87,33 @@ describe "VirtualBox diagnostics through Kitchen" do
     config = File.join(@directory, "kitchen.yml")
     settings = YAML.safe_load_file(config)
     settings.fetch("driver").merge!(
-      "box_manifest" => "manifest.json",
+      "box_manifest" => "catalog/manifest.json",
       "box_cache" => File.join(@directory, "box-cache"),
       "box" => { "name" => "demo", "version" => "1.0.0" }
     )
     File.write(config, YAML.dump(settings))
-    box = File.join(@directory, "demo.box")
+    catalog = File.join(@directory, "catalog")
+    Dir.mkdir(catalog)
+    box = File.join(catalog, "demo.box")
     File.write(box, "box archive fixture")
     architecture = RbConfig::CONFIG.fetch("host_cpu")
     architecture = { "aarch64" => "arm64", "x86_64" => "amd64" }.fetch(architecture, architecture)
     entry = { name: "demo", version: "1.0.0", provider: "virtualbox", architecture: architecture,
               file: "demo.box", bytes: File.size(box), sha256: Digest::SHA256.file(box).hexdigest }
-    File.write(File.join(@directory, "manifest.json"), JSON.generate([entry]))
+    File.write(File.join(catalog, "manifest.json"), JSON.generate([entry]))
 
     output, process = kitchen("missing", "doctor")
     _(process.success?).must_equal true, output
 
+    settings.fetch("driver")["box_cache"] = File.join(catalog, "box-cache")
+    File.write(config, YAML.dump(settings))
+    output, process = kitchen("missing", "doctor")
+    _(process.exitstatus).must_equal 1
+    _(output).must_include "Keep the local box cache outside the manifest directory"
+    _(File.exist?(File.join(catalog, "box-cache"))).must_equal false
+
+    settings.fetch("driver")["box_cache"] = File.join(@directory, "box-cache")
+    File.write(config, YAML.dump(settings))
     File.delete(box)
     output, process = kitchen("missing", "doctor")
     _(process.exitstatus).must_equal 1
