@@ -7,14 +7,15 @@ require "yaml"
 driver, platform, bootstrap_prefix = ARGV
 
 def kitchen(*arguments)
-  output, status = Open3.capture2e(RbConfig.ruby, File.join(__dir__, "run.rb"), *arguments)
+  output, warnings, status = Open3.capture3(RbConfig.ruby, File.join(__dir__, "run.rb"), *arguments)
+  warn warnings unless warnings.empty?
   abort output unless status.success?
 
   output
 end
 
 provisioners = { "ansible" => "ansible_playbook", "cinc" => "cinc_infra", "puppet" => "puppet_apply" }
-expected_names = provisioners.keys.map { |suite| "#{suite}-#{platform}" }
+expected_names = provisioners.keys.map { |suite| "#{suite}-#{platform}" }.sort
 actual_names = kitchen("list", "--bare").lines.map(&:strip).sort
 abort "Expected #{expected_names.inspect}, got #{actual_names.inspect}" unless actual_names == expected_names
 
