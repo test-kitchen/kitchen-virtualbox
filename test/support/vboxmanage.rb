@@ -14,7 +14,7 @@ when "list"
   abort "unexpected list target" unless %w{vms hdds}.include?(target)
 
   registry.each { |id, vm| puts %("#{vm.fetch("name")}" {#{id}}) } if target == "vms"
-  if target == "hdds"
+  if target == "hdds" && File.file?(disks_path)
     JSON.parse(File.read(disks_path)).each do |id, (path, parent)|
       puts "UUID: #{id}", "Parent UUID: #{parent}", "Location: #{path}", ""
     end
@@ -110,6 +110,10 @@ when "startvm"
   registry.fetch(uuid)["state"] = "running"
 when "controlvm"
   registry.fetch(uuid)["state"] = "poweroff"
+when "snapshot"
+  abort "unexpected snapshot operation" unless uuid && options == %w{list --machinereadable}
+
+  puts "This machine does not have any snapshots"
 when "unregistervm"
   abort "linked clone teardown must preserve shared media" if registry.fetch(uuid)["linked_snapshot"] && options.include?("--delete")
   failure_marker = File.join(File.dirname(registry_path), "fail_unregister_once")
