@@ -67,8 +67,11 @@ driver:
   `kitchen create` to restore it. With the address omitted, the guest must
   already configure its private adapter.
 
-SSH continues to use the first adapter and its loopback NAT forward. To
-change private networking for an existing VM or change forwarding while it
+SSH continues to use the first adapter and its loopback NAT forward.
+By default, secondary adapters retain their imported settings. With
+`private_network` configured, Kitchen replaces adapter 2's attachment and
+disables adapters 3–8 so inherited connections cannot bypass the private network.
+To change private networking for an existing VM or change forwarding while it
 is running, run `kitchen destroy` followed by `kitchen create`. Bridged
 networking, host-only adapters, IPv6 configuration and UDP forwarding are
 unsupported.

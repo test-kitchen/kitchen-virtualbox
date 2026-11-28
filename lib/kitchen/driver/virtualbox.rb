@@ -34,7 +34,6 @@ module Kitchen
       def create(state)
         forward_ports = configured_forward_ports
         private_network, private_address = private_network_settings
-        verify_private_settings(state, private_network, private_address)
         prepare_state(state)
         uuid = registered_uuid(state) || import_vm(state)
         state[:virtualbox_uuid] = uuid
@@ -150,9 +149,12 @@ module Kitchen
         raise ActionFailed, "VirtualBox driver.private_address requires a valid IPv4 CIDR address"
       end
 
-      def verify_private_settings(state, network, address)
-        return unless state[:virtualbox_private_network]
-        return if state.values_at(:virtualbox_private_network, :virtualbox_private_address) == [network, address]
+      def verify_private_settings(state, actual_network, network, address)
+        applied = state.values_at(:virtualbox_private_network, :virtualbox_private_address)
+        pending = state[:virtualbox_pending_private_settings]
+        # A command may fail before changing the NIC or after VirtualBox has applied it.
+        recorded = [applied, pending].compact.find { |settings| actual_network && settings.first == actual_network }
+        return if recorded.nil? || recorded == [network, address]
 
         raise ActionFailed, "VirtualBox VM has different private networking settings. Run kitchen destroy and then kitchen create."
       end
@@ -161,28 +163,36 @@ module Kitchen
         host_port, guest_port = forward_ports
         forward_rule = "kitchen-forward,tcp,127.0.0.1,#{host_port},,#{guest_port}" if host_port
         info = vm_info(uuid)
+        actual_network = info["intnet2"] if info["nic2"] == "intnet"
+        verify_private_settings(state, actual_network, private_network, private_address)
+        extra_adapters = info.keys.grep(/\Anic[3-8]\z/).reject { |key| info[key] == "none" }
         forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
         if info.fetch("VMState") == "running"
           rule = forwarding.find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
           raise ActionFailed, "Running VirtualBox VM is missing its Kitchen SSH forwarding rule" unless rule
 
           actual_forward = forwarding.find { |value| value.start_with?("kitchen-forward,") }
-          actual_network = info["intnet2"] if info["nic2"] == "intnet"
-          if actual_forward != forward_rule || (private_network && actual_network != private_network)
+          private_mismatch = private_network && (actual_network != private_network || !extra_adapters.empty?)
+          if actual_forward != forward_rule || private_mismatch
             raise ActionFailed, "Running VirtualBox VM has different networking settings. Run kitchen destroy and then kitchen create."
           end
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
           state[:port] = ssh_host_port(host_port)
-          record_private_settings(state, private_network, private_address)
           forwarding.each do |existing_rule|
             vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
           end
           options = ["--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}"]
           options.push("--nat-pf1", forward_rule) if forward_rule
-          options.push("--nic2", "intnet", "--intnet2", private_network, "--cable-connected2", "on") if private_network
           vbox("modifyvm", uuid, *options)
+          if private_network
+            state[:virtualbox_pending_private_settings] = [private_network, private_address]
+            checkpoint(state)
+            adapters = ["--intnet2", private_network, "--nic2", "intnet", "--cable-connected2", "on"]
+            extra_adapters.each { |key| adapters.push("--#{key}", "none") }
+            vbox("modifyvm", uuid, *adapters)
+          end
         end
 
         state[:hostname] = "127.0.0.1"
@@ -191,10 +201,16 @@ module Kitchen
       end
 
       def record_private_settings(state, network, address)
-        return unless network && !state[:virtualbox_private_network]
+        pending = state.delete(:virtualbox_pending_private_settings)
+        return if !pending && state.values_at(:virtualbox_private_network, :virtualbox_private_address) == [network, address]
 
-        state[:virtualbox_private_network] = network
-        state[:virtualbox_private_address] = address
+        if network
+          state[:virtualbox_private_network] = network
+          state[:virtualbox_private_address] = address
+        else
+          state.delete(:virtualbox_private_network)
+          state.delete(:virtualbox_private_address)
+        end
         checkpoint(state)
       end
 
