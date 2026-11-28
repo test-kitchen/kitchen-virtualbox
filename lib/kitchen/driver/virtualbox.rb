@@ -185,7 +185,7 @@ module Kitchen
       def remove_linked_clone_artifacts(directory, state)
         files = [File.join(directory, "ssh_key")]
         if (config_file = state[:virtualbox_linked_config])
-          files.concat([config_file, "#{config_file}-prev", "#{config_file}-tmp", config_file.sub(/\.vbox\z/, ".nvram")])
+          files.push(config_file, "#{config_file}-prev", "#{config_file}-tmp", config_file.sub(/\.vbox\z/, ".nvram"))
         end
         if (logs = state[:virtualbox_linked_logs]) && inside_directory?(canonical_disk_path(logs), directory)
           files.concat(Dir.glob("VBox.log{,.[0-9]*}", base: logs).map { |name| File.join(logs, name) })
