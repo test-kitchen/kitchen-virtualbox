@@ -24,6 +24,7 @@ when "showvminfo"
   puts %{UUID="#{uuid}"}
   puts %{VMState="#{vm.fetch("state")}"}
   puts %{"SATA Controller-ImageUUID-0-0"="#{uuid}"} if vm["linked_snapshot"]
+  puts %{CfgFile="#{vm.fetch("config")}"} if vm.key?("config")
   puts 'nic1="nat"'
   puts %{nic2="#{vm.fetch("nic2", "none")}"}
   puts %{Forwarding(0)="#{vm["forwarding1"]},tcp,,8080,,80"} if vm["forwarding1"]
@@ -57,6 +58,9 @@ when "clonevm"
     directory = File.realpath(options.fetch(options.index("--basefolder") + 1))
     clone_disk = File.join(directory, "clone.vmdk")
     File.write(clone_disk, "")
+    config = File.join(directory, "clone.vbox")
+    File.write(config, "original clone configuration")
+    registry[clone_uuid]["config"] = config
     disks = JSON.parse(File.read(disks_path))
     disks[clone_uuid] = [clone_disk, uuid]
     File.write(disks_path, JSON.generate(disks))

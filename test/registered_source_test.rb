@@ -119,6 +119,19 @@ class RegisteredSourceTest < Minitest::Test
     assert_equal({ SOURCE => { "name" => "Disposable source", "state" => "running" } }, registry)
   end
 
+  def test_destroy_preserves_a_replacement_clone_configuration
+    configure_linked_clone
+    assert_kitchen "create"
+    _, clone = registry.find { |id, _| id != SOURCE }
+    config = clone.fetch("config")
+    File.rename(config, "#{config}.original")
+    File.write(config, "replacement configuration")
+
+    assert_kitchen "destroy"
+    assert_equal "replacement configuration", File.read(config)
+    assert_equal "original clone configuration", File.read("#{config}.original")
+  end
+
   def test_converge_and_destroy_a_linked_clone_without_deleting_shared_media
     source = configure_linked_clone
     configure_clone_network

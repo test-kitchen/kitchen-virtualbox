@@ -113,6 +113,7 @@ module Kitchen
         checkpoint(state) unless state[:virtualbox_restore_pending]
         attach_blank_disk(uuid, state, size) if size && !state[:virtualbox_restore_pending]
         ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
+        record_linked_clone_artifacts(uuid, state) if state[:virtualbox_linked_clone]
         configure_ssh(uuid, state)
         connection = instance.transport.connection(state.except(:virtualbox_restore_pending))
         connection.wait_until_ready
@@ -142,6 +143,7 @@ module Kitchen
             checkpoint(state)
           end
           info = vm_info(uuid)
+          tracked_config = linked_config_artifacts(info["CfgFile"], state) if state[:virtualbox_linked_clone]
           status = info.fetch("VMState")
           case status
           when "running", "paused", "stuck"
@@ -151,7 +153,10 @@ module Kitchen
           end
           # Linked clones share a disk chain with their source.
           if state[:virtualbox_linked_clone]
+            detach_linked_clone_owned_disks(uuid, info, state)
+            clean_owned_media(state)
             vbox("unregistervm", uuid)
+            refresh_linked_config_artifacts(uuid, state, tracked_config)
           else
             detach_unowned_media(uuid, info, state)
             vbox("unregistervm", uuid, "--delete")
@@ -590,8 +595,6 @@ module Kitchen
 
           [chain, disk_file_identity(path)]
         end
-        state[:virtualbox_linked_config] = info["CfgFile"]
-        state[:virtualbox_linked_logs] = info["LogFldr"]
         checkpoint(state)
       end
 
@@ -607,6 +610,16 @@ module Kitchen
           id = parent
         end
         chain
+      end
+
+      def detach_linked_clone_owned_disks(uuid, info, state)
+        owned_disks = verified_owned_disks(state)
+        storage_slots(info).each do |(controller, port, device), path|
+          id = info[%Q{"#{controller}-ImageUUID-#{port}-#{device}"}]
+          next unless owned_disks.key?(id) && owned_disks[id] == path
+
+          vbox("storageattach", uuid, "--storagectl", controller, "--port", port, "--device", device, "--medium", "none")
+        end
       end
 
       def close_linked_clone_media(directory, state)
@@ -644,28 +657,85 @@ module Kitchen
         [stat.dev, stat.ino]
       end
 
-      def remove_linked_clone_artifacts(directory, state)
-        files = [File.join(directory, "ssh_key")]
-        if (config_file = state[:virtualbox_linked_config])
-          files.push(config_file, "#{config_file}-prev", "#{config_file}-tmp", config_file.sub(/\.vbox\z/, ".nvram"))
+      def record_linked_clone_artifacts(uuid, state)
+        return if state.key?(:virtualbox_linked_artifacts)
+
+        directory = vm_directory(state)
+        info = vm_info(uuid)
+        files = []
+        if (config_file = info["CfgFile"])
+          files.push(config_file, "#{config_file}-prev", config_file.sub(/\.vbox\z/, ".nvram"))
         end
-        if (logs = state[:virtualbox_linked_logs]) && inside_directory?(canonical_disk_path(logs), directory)
+        if (logs = info["LogFldr"]) && inside_directory?(canonical_disk_path(logs), directory)
           files.concat(Dir.glob("VBox.log{,.[0-9]*}", base: logs).map { |name| File.join(logs, name) })
         end
 
-        registered = hard_disks.values.flat_map { |path, _, location| [path, location] }
-        files.uniq.each do |file|
+        artifacts = {}
+        files.each do |file|
           path = canonical_disk_path(file)
-          next unless inside_directory?(path, directory) && File.file?(file)
-          next if File.symlink?(file) || registered.include?(path) || registered.include?(file)
+          next unless inside_directory?(path, directory) && File.file?(file) && !File.symlink?(file)
 
-          File.unlink(file)
+          artifacts[path] = disk_file_identity(path)
+          parent = File.dirname(path)
+          while inside_directory?(parent, directory)
+            artifacts[parent] = disk_file_identity(parent)
+            parent = File.dirname(parent)
+          end
         end
-        Dir.glob("**/*/", base: directory).reverse_each do |relative|
-          path = File.join(directory, relative.delete_suffix("/"))
-          Dir.rmdir(path) if !File.symlink?(path) && Dir.empty?(path)
+        state.fetch(:virtualbox_linked_media).each do |chain, _|
+          parent = File.dirname(chain.first[1])
+          artifacts[parent] = disk_file_identity(parent) if inside_directory?(parent, directory)
         end
-        Dir.rmdir(directory) if Dir.empty?(directory)
+        state[:virtualbox_linked_artifacts] = artifacts.to_a
+        checkpoint(state)
+      end
+
+      def linked_config_artifacts(config_path, state)
+        return [] unless config_path
+
+        canonical = canonical_disk_path(config_path)
+        return [] unless canonical
+
+        config_paths = [canonical, "#{canonical}-prev"]
+        Array(state[:virtualbox_linked_artifacts]).select do |path, identity|
+          config_paths.include?(path) && canonical_disk_path(path) == path && disk_file_identity(path) == identity
+        end
+      end
+
+      def refresh_linked_config_artifacts(uuid, state, tracked)
+        return if tracked.empty?
+
+        artifacts = state.fetch(:virtualbox_linked_artifacts).to_h
+        tracked.each do |path, identity|
+          next unless canonical_disk_path(path) == path && File.file?(path)
+
+          current = disk_file_identity(path)
+          next if current == identity
+
+          config = REXML::Document.new(File.binread(path))
+          machine = config.elements["/VirtualBox/Machine"]
+          artifacts[path] = current if machine&.attributes&.fetch("uuid", nil)&.casecmp?("{#{uuid}}")
+        rescue REXML::ParseException, SystemCallError
+          next
+        end
+        state[:virtualbox_linked_artifacts] = artifacts.to_a
+        checkpoint(state)
+      end
+
+      def remove_linked_clone_artifacts(directory, state)
+        artifacts = Array(state[:virtualbox_linked_artifacts])
+        registered = hard_disks.values.flat_map { |path, _, location| [path, location] }
+
+        artifacts.sort_by { |path, _| -path.length }.each do |path, identity|
+          next unless inside_directory?(path, directory) && canonical_disk_path(path) == path
+          next if registered.include?(path) || disk_file_identity(path) != identity
+
+          if File.file?(path)
+            File.unlink(path)
+          elsif File.directory?(path) && Dir.empty?(path)
+            Dir.rmdir(path)
+          end
+        end
       end
 
       def inside_directory?(path, directory)
