@@ -1,6 +1,7 @@
 # Copyright 2026 Dan Webb
 # SPDX-License-Identifier: Apache-2.0
 
+require "digest" unless defined?(Digest)
 require "fileutils" unless defined?(FileUtils)
 require "ipaddr" unless defined?(IPAddr)
 require "kitchen"
@@ -31,6 +32,7 @@ module Kitchen
       default_config :port_forward
       default_config :private_network
       default_config :private_address
+      default_config :synced_folders, []
 
       # VBoxManage's guest limits on the 64-bit hosts supported by VirtualBox 7.2.
       HARDWARE_LIMITS = { cpus: (1..64), memory: (4..2_097_152) }.freeze
@@ -42,11 +44,12 @@ module Kitchen
         validate_hardware
         forward_ports = configured_forward_ports
         private_network, private_address = private_network_settings
+        folders = synced_folders
         prepare_state(state)
         uuid = registered_uuid(state) || import_vm(state)
         state[:virtualbox_uuid] = uuid
         checkpoint(state)
-        ensure_running(uuid, state, forward_ports, private_network, private_address)
+        ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
         configure_ssh(uuid, state)
         connection = instance.transport.connection(state)
         connection.wait_until_ready
@@ -102,6 +105,103 @@ module Kitchen
       end
 
       private
+
+      def synced_folders
+        entries = config[:synced_folders]
+        unless entries.is_a?(Array)
+          raise ActionFailed, "driver.synced_folders must be a list of host and guest path pairs"
+        end
+
+        folders = entries.filter_map { |entry| synced_folder(entry) }
+        unless folders.map { |folder| folder[:target] }.uniq.size == folders.size
+          raise ActionFailed, "Synced folder guest paths must be unique"
+        end
+
+        folders.each { |folder| FileUtils.mkdir_p(folder[:source]) if folder[:create] }
+        folders
+      rescue SystemCallError => e
+        raise ActionFailed, "Could not prepare synced folder: #{e.message}"
+      end
+
+      def synced_folder(entry)
+        unless entry.is_a?(Array) && (2..3).cover?(entry.size) &&
+            entry.first(2).all? { |path| path.is_a?(String) && !path.empty? && !path.match?(/[\x00\r\n]/) }
+          raise ActionFailed, "Each synced_folders entry needs a host path, a guest path, and optional YAML options"
+        end
+
+        source, target, options = entry
+        options = {} if options.nil?
+        unless options.is_a?(Hash) && (options.keys - %i{create disabled readonly}).empty? &&
+            options.values.all? { |value| [true, false].include?(value) }
+          raise ActionFailed, "Synced folder options create, disabled and readonly must be boolean"
+        end
+        return if options[:disabled]
+
+        unless target.start_with?("/") && (target = File.expand_path(target.sub(%r{\A/+}, "/"))) != "/"
+          raise ActionFailed, "Synced folder guest paths must be absolute paths other than /"
+        end
+
+        source = File.expand_path(source.gsub("%{instance_name}", instance.name), config[:kitchen_root])
+        unless File.directory?(source) || (options[:create] && !File.exist?(source))
+          raise ActionFailed, "Synced folder host directory does not exist: #{source}"
+        end
+
+        source = canonical_host_path(source)
+        state_directory = File.join(File.realpath(config[:kitchen_root]), ".kitchen")
+        managed_paths = [state_directory, canonical_host_path(state_directory)].uniq
+        if managed_paths.any? { |path| source == path || source.start_with?(File.join(path, "")) }
+          raise ActionFailed, "Synced folder host directory must be outside Kitchen's managed .kitchen directory"
+        end
+
+        readonly = options.fetch(:readonly, false)
+        if !readonly && managed_paths.any? { |path| path.start_with?(File.join(source, "")) }
+          raise ActionFailed, "Writable synced folders must not contain Kitchen's managed .kitchen directory"
+        end
+
+        unless readonly
+          cache_directory = canonical_host_path(Box::Cache.new(config[:box_cache]).root)
+          if source == cache_directory || source.start_with?(File.join(cache_directory, "")) ||
+              cache_directory.start_with?(File.join(source, ""))
+            raise ActionFailed, "Writable synced folders must not overlap Kitchen's box cache"
+          end
+        end
+
+        { source: source, target: target, readonly: readonly, create: options[:create] }
+      end
+
+      def canonical_host_path(path)
+        File.realpath(path)
+      rescue Errno::ENOENT
+        raise if File.symlink?(path)
+
+        File.join(canonical_host_path(File.dirname(path)), File.basename(path))
+      end
+
+      def configure_shared_folders(uuid, state, folders, info)
+        existing = info.filter_map { |key, value| value if key.start_with?("SharedFolderNameMachineMapping") }
+        owned = Array(state[:virtualbox_managed_shares])
+        desired = folders.to_h do |folder|
+          ["kitchen-#{Digest::SHA256.hexdigest(folder.fetch(:target))[0, 16]}", folder]
+        end
+        collisions = (existing & desired.keys) - owned
+        unless collisions.empty?
+          raise ActionFailed, "VirtualBox shared folder name already exists: #{collisions.join(", ")}"
+        end
+        return if owned.empty? && desired.empty?
+
+        # Save both sets before changing the VM so a partial failure is retryable.
+        state[:virtualbox_managed_shares] = owned | desired.keys
+        checkpoint(state)
+        (existing & owned).each { |name| vbox("sharedfolder", "remove", uuid, "--name=#{name}") }
+
+        desired.each do |name, folder|
+          arguments = ["--name=#{name}", "--hostpath=#{folder.fetch(:source)}", "--automount", "--auto-mount-point=#{folder.fetch(:target)}"]
+          arguments << "--readonly" if folder.fetch(:readonly)
+          vbox("sharedfolder", "add", uuid, *arguments)
+        end
+        state[:virtualbox_managed_shares] = desired.keys
+        checkpoint(state)
+      end
 
       def validate_hardware
         HARDWARE_LIMITS.each do |setting, range|
@@ -241,7 +341,7 @@ module Kitchen
         raise ActionFailed, "VirtualBox VM has different private networking settings. Run kitchen destroy and then kitchen create."
       end
 
-      def ensure_running(uuid, state, forward_ports, private_network, private_address)
+      def ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
         host_port, guest_port = forward_ports
         forward_rule = "kitchen-forward,tcp,127.0.0.1,#{host_port},,#{guest_port}" if host_port
         info = vm_info(uuid)
@@ -261,6 +361,7 @@ module Kitchen
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
+          configure_shared_folders(uuid, state, folders, info)
           state[:port] = ssh_host_port(host_port)
           forwarding.each do |existing_rule|
             vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
