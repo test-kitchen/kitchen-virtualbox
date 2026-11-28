@@ -21,7 +21,7 @@ Dir.mktmpdir("kitchen-virtualbox-lifecycle") do |root|
     require "fileutils"
     case ARGV.first
     when "list"
-      puts File.read("registered") if File.file?("registered")
+      puts File.read("registered") if ARGV[1] == "vms" && File.file?("registered")
     when "import"
       abort "Already imported" if File.exist?("registered")
       File.write("registered", %Q{"\#{ARGV.fetch(ARGV.index("--vmname") + 1)}" {#{uuid}}})
@@ -49,6 +49,10 @@ Dir.mktmpdir("kitchen-virtualbox-lifecycle") do |root|
     when "controlvm"
       abort "Unexpected poweroff" unless ARGV == ["controlvm", "#{uuid}", "poweroff"]
       File.delete("running")
+    when "snapshot"
+      abort "Unexpected snapshot operation" unless ARGV == ["snapshot", "#{uuid}", "list", "--machinereadable"]
+
+      puts "This machine does not have any snapshots"
     when "unregistervm"
       abort "Unexpected unregister" unless ARGV == ["unregistervm", "#{uuid}", "--delete"]
       File.delete("registered")
