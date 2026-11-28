@@ -37,6 +37,31 @@ Catalog-backed boxes are copied to the local Kitchen cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
 
+## Shared folders
+
+Use `driver.synced_folders` to mount host directories in a Linux
+guest. Each entry gives the host directory and the absolute guest mount path.
+Relative host paths resolve from the Kitchen project directory. Shares are
+writable by default. Set `readonly: true` on any share that should allow only reads.
+Set `create: true` to create a missing host directory and `disabled: true` to
+skip a share. Use `%{instance_name}` in a host path for per-instance directories.
+Use a dedicated directory for writable shares to keep Kitchen's state outside
+the guest's write access.
+
+```yaml
+driver:
+  name: virtualbox
+  synced_folders:
+    - ["./fixtures", "/mnt/fixtures", { readonly: true }]
+    - ["./results", "/mnt/results"]
+```
+
+Install VirtualBox Guest Additions with automount support in the guest. Use
+root or the permissions provided by the guest's `vboxsf` group to access
+the mounts. Run `kitchen destroy` and `kitchen create` to apply share changes
+to an existing instance. Destroy removes the VM and preserves the shared
+host directories and their contents.
+
 ## Apache smoke tests
 
 Mount the NAS or set `KITCHEN_BOX_MANIFEST` to a manifest containing the

@@ -1,6 +1,7 @@
 # Copyright 2026 Dan Webb
 # SPDX-License-Identifier: Apache-2.0
 
+require "digest" unless defined?(Digest)
 require "fileutils" unless defined?(FileUtils)
 require "kitchen"
 require "kitchen/box/local_archive"
@@ -24,15 +25,17 @@ module Kitchen
       default_config :box_cache
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
+      default_config :synced_folders, []
 
       include Box::Source
 
       def create(state)
+        folders = synced_folders
         prepare_state(state)
         uuid = registered_uuid(state) || import_vm(state)
         state[:virtualbox_uuid] = uuid
         checkpoint(state)
-        ensure_running(uuid, state)
+        ensure_running(uuid, state, folders)
         configure_ssh(uuid, state)
         instance.transport.connection(state).wait_until_ready
       end
@@ -56,6 +59,84 @@ module Kitchen
       end
 
       private
+
+      def synced_folders
+        entries = config[:synced_folders]
+        unless entries.is_a?(Array)
+          raise ActionFailed, "driver.synced_folders must be a list of host and guest path pairs"
+        end
+
+        folders = entries.filter_map { |entry| synced_folder(entry) }
+        unless folders.map { |folder| folder[:target] }.uniq.size == folders.size
+          raise ActionFailed, "Synced folder guest paths must be unique"
+        end
+
+        folders.each { |folder| FileUtils.mkdir_p(folder[:source]) if folder[:create] }
+        folders
+      rescue SystemCallError => e
+        raise ActionFailed, "Could not prepare synced folder: #{e.message}"
+      end
+
+      def synced_folder(entry)
+        unless entry.is_a?(Array) && (2..3).cover?(entry.size) &&
+            entry.first(2).all? { |path| path.is_a?(String) && !path.empty? && !path.match?(/[\x00\r\n]/) }
+          raise ActionFailed, "Each synced_folders entry needs a host path, a guest path, and optional YAML options"
+        end
+
+        source, target, options = entry
+        options = {} if options.nil?
+        unless options.is_a?(Hash) && (options.keys - %i{create disabled readonly}).empty? &&
+            options.values.all? { |value| [true, false].include?(value) }
+          raise ActionFailed, "Synced folder options create, disabled and readonly must be boolean"
+        end
+        return if options[:disabled]
+
+        unless target.start_with?("/") && (target = File.expand_path(target.sub(%r{\A/+}, "/"))) != "/"
+          raise ActionFailed, "Synced folder guest paths must be absolute paths other than /"
+        end
+
+        source = File.expand_path(source.gsub("%{instance_name}", instance.name), config[:kitchen_root])
+        unless File.directory?(source) || (options[:create] && !File.exist?(source))
+          raise ActionFailed, "Synced folder host directory does not exist: #{source}"
+        end
+
+        source = canonical_host_path(source)
+        state_directory = File.join(File.realpath(config[:kitchen_root]), ".kitchen")
+        managed_paths = [state_directory, canonical_host_path(state_directory)].uniq
+        if managed_paths.any? { |path| source == path || source.start_with?(File.join(path, "")) }
+          raise ActionFailed, "Synced folder host directory must be outside Kitchen's managed .kitchen directory"
+        end
+
+        readonly = options.fetch(:readonly, false)
+        if !readonly && managed_paths.any? { |path| path.start_with?(File.join(source, "")) }
+          raise ActionFailed, "Writable synced folders must not contain Kitchen's managed .kitchen directory"
+        end
+
+        { source: source, target: target, readonly: readonly, create: options[:create] }
+      end
+
+      def canonical_host_path(path)
+        File.realpath(path)
+      rescue Errno::ENOENT
+        raise if File.symlink?(path)
+
+        File.join(canonical_host_path(File.dirname(path)), File.basename(path))
+      end
+
+      def configure_shared_folders(uuid, folders, info)
+        existing = info.filter_map { |key, value| value if key.start_with?("SharedFolderNameMachineMapping") }
+        folders.each do |folder|
+          # A stable name lets a retry replace a share already registered on the VM.
+          name = "kitchen-#{Digest::SHA256.hexdigest(folder.fetch(:target))[0, 16]}"
+          if existing.include?(name)
+            vbox("sharedfolder", "remove", uuid, "--name=#{name}")
+          end
+
+          arguments = ["--name=#{name}", "--hostpath=#{folder.fetch(:source)}", "--automount", "--auto-mount-point=#{folder.fetch(:target)}"]
+          arguments << "--readonly" if folder.fetch(:readonly)
+          vbox("sharedfolder", "add", uuid, *arguments)
+        end
+      end
 
       def prepare_state(state)
         return if state[:virtualbox_token]
@@ -112,7 +193,7 @@ module Kitchen
         raise ActionFailed, e.message
       end
 
-      def ensure_running(uuid, state)
+      def ensure_running(uuid, state, folders)
         info = vm_info(uuid)
         forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
         if info.fetch("VMState") == "running"
@@ -121,6 +202,7 @@ module Kitchen
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
+          configure_shared_folders(uuid, folders, info) unless folders.empty?
           forwarding.each do |rule|
             vbox("modifyvm", uuid, "--nat-pf1", "delete=#{rule.split(",").first}")
           end
