@@ -1,7 +1,7 @@
 # kitchen-virtualbox
 
 Run Test Kitchen against disposable Linux VirtualBox guests. This driver uses
-VirtualBox 7.2's `VBoxManage`, the box library in this Test Kitchen checkout and
+VirtualBox 7.2's `VBoxManage`, Test Kitchen's shared box library and
 Kitchen's SSH transport.
 
 ```yaml
@@ -50,9 +50,44 @@ Kitchen project. This driver requires Test Kitchen 4.2 or newer for the
 shared box catalog and cache API.
 Set `TEST_KITCHEN_PATH` to use another compatible local checkout.
 
-Catalog-backed boxes are copied to the local Kitchen cache. Use
+Kitchen stores verified catalog-backed boxes in its local cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
+
+## Download a pinned remote box
+
+Use a local catalog with an HTTPS `url` in place of `file`. Record the
+archive's exact byte count and SHA-256 from a trusted source. Keep separate
+entries for each version, provider and architecture you offer. For example,
+the following catalog structure uses illustrative values for the URL, size
+and digest.
+
+```json
+[
+  {
+    "name": "bento/ubuntu-24.04",
+    "version": "202510.26.0",
+    "provider": "virtualbox",
+    "architecture": "arm64",
+    "url": "https://boxes.example.org/ubuntu-24.04-202510.26.0-virtualbox-arm64.box",
+    "bytes": 123456789,
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  }
+]
+```
+
+Point `driver.box_manifest` at the catalog and set `driver.box` to
+`{ name: bento/ubuntu-24.04, version: "202510.26.0" }`. On create, Kitchen
+streams the matching archive into its cache and checks its size and SHA-256
+before VirtualBox imports it. Later creates reuse the verified cache entry.
+
+To update, add the new version and its integrity values to the catalog, run
+`kitchen destroy`, change the pinned version in `driver.box`, then run
+`kitchen create`. Remote entries require a Test Kitchen release with URL
+catalog support. During development, set `TEST_KITCHEN_PATH` to a checkout
+with that support. Use `kitchen box doctor --checksum` to download and verify
+remote entries. Filter by name, version, provider and architecture to check
+a specific archive.
 
 ## Networking
 
