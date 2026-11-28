@@ -11,6 +11,7 @@ jobs:
   remote-box:
     runs-on: ubuntu-latest
     env:
+      BUNDLE_WITHOUT: development:smoke
       TEST_KITCHEN_PATH: ${{ github.workspace }}/kitchen-core
     steps:
       - uses: actions/checkout@v7
