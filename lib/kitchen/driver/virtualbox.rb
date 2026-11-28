@@ -24,14 +24,30 @@ module Kitchen
       default_config :box_cache
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
+      default_config :disk_size_mib
 
       include Box::Source
 
       def create(state)
+        size = config[:disk_size_mib]
+        unless size.nil? || (size.is_a?(Integer) && size > 0)
+          raise ActionFailed, "VirtualBox driver.disk_size_mib must be a positive integer"
+        end
+
         prepare_state(state)
         uuid = registered_uuid(state) || import_vm(state)
+        unless state[:virtualbox_uuid]
+          directory = File.realpath(vm_directory(state))
+          state[:virtualbox_owned_media] = storage_slots(vm_info(uuid)).values.filter_map do |medium|
+            next unless File.file?(medium)
+
+            path = File.realpath(medium)
+            path if path.start_with?("#{directory}/")
+          end
+        end
         state[:virtualbox_uuid] = uuid
         checkpoint(state)
+        attach_blank_disk(uuid, state, size) if size
         ensure_running(uuid, state)
         configure_ssh(uuid, state)
         instance.transport.connection(state).wait_until_ready
@@ -40,22 +56,134 @@ module Kitchen
       def destroy(state)
         return unless state[:virtualbox_token]
 
+        directory = vm_directory(state)
         if (uuid = registered_uuid(state))
-          status = vm_info(uuid).fetch("VMState")
+          info = vm_info(uuid)
+          status = info.fetch("VMState")
           case status
           when "running", "paused", "stuck"
             vbox("controlvm", uuid, "poweroff")
           when "saved"
             vbox("discardstate", uuid)
           end
+          detach_unowned_media(uuid, info, state)
           vbox("unregistervm", uuid, "--delete")
         end
-        directory = vm_directory(state)
-        FileUtils.remove_entry_secure(directory) if File.exist?(directory)
+        clean_owned_media(state)
+        if state[:virtualbox_owned_media]
+          FileUtils.rm_f(File.join(directory, "ssh_key"))
+          Dir.rmdir(directory) if File.directory?(directory) && Dir.empty?(directory)
+        elsif File.exist?(directory)
+          FileUtils.remove_entry_secure(directory)
+        end
         release_box_source(state)
       end
 
       private
+
+      def attach_blank_disk(uuid, state, size)
+        unless state[:virtualbox_owned_media]
+          raise ActionFailed, "Recreate the VirtualBox instance before enabling driver.disk_size_mib"
+        end
+
+        info = vm_info(uuid)
+        path = state[:virtualbox_blank_disk]
+        if state[:virtualbox_disk_size_mib] && state[:virtualbox_disk_size_mib] != size
+          raise ActionFailed, "Destroy the VirtualBox instance before changing driver.disk_size_mib"
+        end
+        return if path && storage_slots(info).value?(path)
+
+        unless info.fetch("VMState") == "poweroff"
+          raise ActionFailed, "Power off the VirtualBox instance before attaching a blank test disk"
+        end
+
+        controller, port, device = ensure_free_disk_slot(uuid, info)
+        unless path
+          path = File.join(File.realpath(vm_directory(state)), "test-disk-#{SecureRandom.uuid}.vdi")
+          state[:virtualbox_blank_disk] = path
+          state[:virtualbox_disk_size_mib] = size
+          checkpoint(state)
+        end
+        vbox("createmedium", "disk", "--filename", path, "--size", size.to_s, "--format", "VDI") unless File.file?(path)
+        vbox("storageattach", uuid, "--storagectl", controller, "--port", port, "--device", device,
+          "--type", "hdd", "--medium", path)
+      end
+
+      def ensure_free_disk_slot(uuid, info)
+        slots = storage_slots(info)
+        expandable = nil
+        info.each_key do |key|
+          next unless (match = /\Astoragecontrollername(\d+)\z/.match(key))
+
+          index = match[1]
+          type = info["storagecontrollertype#{index}"]
+          next if %w{I82078 USB}.include?(type)
+
+          name = info.fetch(key)
+          devices = %w{PIIX3 PIIX4 ICH6}.include?(type) ? %w{0 1} : ["0"]
+          port_count = Integer(info.fetch("storagecontrollerportcount#{index}"))
+          max_ports = Integer(info.fetch("storagecontrollermaxportcount#{index}", port_count))
+          expandable ||= [name, port_count] if port_count < max_ports
+          port_count.times do |port|
+            devices.each do |device|
+              medium = slots[[name, port.to_s, device]]
+              return [name, port.to_s, device] if medium.nil? || medium == "none"
+            end
+          end
+        end
+        if expandable
+          name, port = expandable
+          vbox("storagectl", uuid, "--name", name, "--portcount", (port + 1).to_s)
+          return [name, port.to_s, "0"]
+        end
+
+        raise ActionFailed, "VirtualBox VM has no free disk slot for driver.disk_size_mib"
+      end
+
+      def storage_slots(info)
+        controllers = info.filter_map { |key, value| value if /\Astoragecontrollername\d+\z/.match?(key) }
+        info.each_with_object({}) do |(key, value), slots|
+          match = /\A"(.+)-(\d+)-(\d+)"\z/.match(key)
+          slots[match.captures] = value if match && controllers.include?(match[1])
+        end
+      end
+
+      def detach_unowned_media(uuid, info, state)
+        directory = vm_directory(state)
+        owned_directory = File.exist?(directory) ? File.realpath(directory) : directory
+        owned_media = state[:virtualbox_owned_media]
+        storage_slots(info).each do |(controller, port, device), medium|
+          next if %w{none emptydrive}.include?(medium)
+
+          path = File.exist?(medium) ? File.realpath(medium) : medium
+          next if path == state[:virtualbox_blank_disk]
+          next if owned_media ? owned_media.include?(path) : path.start_with?("#{owned_directory}/")
+
+          vbox("storageattach", uuid, "--storagectl", controller, "--port", port, "--device", device, "--medium", "none")
+        end
+      end
+
+      def clean_owned_media(state)
+        directory = vm_directory(state)
+        return unless File.directory?(directory)
+
+        owned_directory = File.realpath(directory)
+        paths = (Array(state[:virtualbox_owned_media]) + [state[:virtualbox_blank_disk]]).compact
+          .select do |path|
+            path.start_with?("#{owned_directory}/") && (!File.exist?(path) || File.realpath(path) == path)
+          end
+        return if paths.empty?
+
+        vbox("list", "hdds").split(/\n\s*\n/).each do |entry|
+          next unless paths.include?(entry[/^Location:[ \t]+(.+)$/, 1])
+
+          uuid = entry[/^UUID:[ \t]+([0-9a-f-]+)$/, 1]
+          raise ActionFailed, "VirtualBox did not report a UUID for an owned disk" unless uuid
+
+          vbox("closemedium", "disk", uuid)
+        end
+        FileUtils.rm_f(paths)
+      end
 
       def prepare_state(state)
         return if state[:virtualbox_token]

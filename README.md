@@ -28,6 +28,13 @@ already has credentials, configure `transport.ssh_key` or
 `transport.password`. Set `insert_key: false` to leave key setup to the image.
 The `vboxmanage` driver option can point to a binary outside `PATH`.
 
+Set `driver.disk_size_mib` to a positive integer to attach an unformatted,
+dynamically allocated VDI before boot. For example, `disk_size_mib: 512` adds
+a 512 MiB test disk in a free slot on the imported appliance. The option is
+omitted by default. Recreate an existing instance to add the disk or change its
+size. For newly created instances, Kitchen deletes its test disk on destroy and
+preserves unrelated attached disks.
+
 After adding a provisioner and suite, run `bundle exec kitchen test` from the
 Kitchen project. This driver requires Test Kitchen 4.2 or newer for the
 shared box catalog and cache API.
