@@ -685,7 +685,6 @@ module Kitchen
       end
 
       def record_linked_clone_artifacts(uuid, state)
-
         directory = vm_directory(state)
         info = vm_info(uuid)
         files = []
