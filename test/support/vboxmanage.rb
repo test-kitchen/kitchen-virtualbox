@@ -20,6 +20,11 @@ when "showvminfo"
   puts 'nic1="nat"'
   puts %{nic2="#{vm.fetch("nic2", "none")}"}
   puts %{Forwarding(0)="#{vm["forwarding1"]},tcp,,8080,,80"} if vm["forwarding1"]
+  if vm["forwards"]
+    vm.fetch("forwards").each_with_index { |rule, index| puts %{Forwarding(#{index})="#{rule}"} }
+  end
+  %w{intnet2 nic3 cpus memory}.each { |key| puts %{#{key}="#{vm.fetch(key)}"} if vm.key?(key) }
+  puts %{macaddress2="080027A1B2C3"}
   if vm["nic2"] == "nat" && vm["forwarding2"]
     puts %{Forwarding(0)="#{vm["forwarding2"]},tcp,,8081,,80"}
   end
@@ -42,8 +47,12 @@ when "clonevm"
   end
 when "modifyvm"
   vm = registry.fetch(uuid)
-  index = options.index("--nic2")
-  vm["nic2"] = options.fetch(index + 1) if index
+  abort "VM must be stopped" unless vm.fetch("state") == "poweroff"
+
+  %w{nic2 nic3 intnet2 cpus memory}.each do |key|
+    index = options.index("--#{key}")
+    vm[key] = options.fetch(index + 1) if index
+  end
   if vm["source"] && options.include?("--vrde")
     expected = { "--vrde" => "off", "--clipboard-mode" => "disabled", "--drag-and-drop" => "disabled",
                  "--usb-ohci" => "off", "--usb-ehci" => "off", "--usb-xhci" => "off",
@@ -51,13 +60,22 @@ when "modifyvm"
     abort "missing clone isolation options" unless expected.all? { |key, value| options.each_cons(2).include?([key, value]) }
     vm["cable1"] = "on"
   end
-  if (index = options.index("--nat-pf1"))
+  options.each_index do |index|
+    next unless options[index] == "--nat-pf1"
+
     rule = options.fetch(index + 1)
+    forwards = vm["forwards"] ||= []
     if rule == "delete"
-      abort "forwarding rule belongs to another adapter" unless options.fetch(index + 2) == vm["forwarding1"]
-      vm.delete("forwarding1")
+      name = options.fetch(index + 2)
+      if vm["forwarding1"] == name
+        vm.delete("forwarding1")
+      else
+        abort "forwarding rule belongs to another adapter" unless forwards.reject! { |existing| existing.split(",").first == name }
+      end
     else
-      abort "expected loopback SSH forwarding" unless rule.start_with?("kitchen-ssh,tcp,127.0.0.1,")
+      abort "expected loopback forwarding" unless /\Akitchen-(ssh|forward),tcp,127[.]0[.]0[.]1,/.match?(rule)
+
+      forwards << rule
     end
   end
 when "sharedfolder"

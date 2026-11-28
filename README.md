@@ -29,7 +29,7 @@ already has credentials, configure `transport.ssh_key` or
 The `vboxmanage` driver option can point to a binary outside `PATH`.
 
 Set `driver.cpus` to the number of virtual processors and `driver.memory` to
-guest RAM in MB when importing a new VM. Both settings accept positive
+guest RAM in MB when importing a VM or starting a registered-source clone. Both settings accept positive
 integers within VirtualBox 7.2's limits (1–64 CPUs and 4–2,097,152 MB).
 Omit either setting to retain the corresponding value from the image.
 Run `kitchen destroy` followed by
@@ -66,6 +66,46 @@ guest disk, including any credentials stored in it. Kitchen removes inherited
 shared folders, disables extra network adapters, USB controllers, remote
 display, clipboard sharing and drag-and-drop, and configures loopback SSH
 forwarding. Review any other host integrations on the template before using it.
+
+## Networking
+
+By default, Kitchen uses a random loopback TCP port to reach the guest over SSH.
+To expose another guest TCP service on the host and connect guests on a private
+VirtualBox internal network, configure either or both options:
+
+```yaml
+driver:
+  name: virtualbox
+  port_forward:
+    host_port: 18080
+    guest_port: 8080
+  private_network: project-test
+  private_address: 192.0.2.31/24
+```
+
+- `port_forward` binds one additional TCP port on `127.0.0.1`. Use a free host
+  port for each VM that forwards a service. The service must listen on the
+  guest's NAT interface.
+- `private_network` attaches a second adapter to a VirtualBox internal
+  network. Other VMs attached to the same named network can communicate. Pick
+  a project-specific name and give each guest a distinct address on a subnet
+  separate from the guest's NAT subnet.
+- `private_address` requires `private_network` and assigns an IPv4 CIDR address
+  to that adapter. Kitchen applies it over SSH after boot. It requires a Linux
+  guest with `ip` and either root SSH access or passwordless `sudo` for `ip`.
+  The address is runtime-only. After an independent guest reboot, rerun
+  `kitchen create` to restore it. With the address omitted, the guest must
+  already configure its private adapter.
+
+SSH continues to use the first adapter and its loopback NAT forward.
+By default, imported VMs retain their secondary adapters and registered-source
+clones have secondary adapters disabled. With
+`private_network` configured, Kitchen replaces adapter 2's attachment and
+disables adapters 3–8 so inherited connections cannot bypass the private network.
+To change private networking for an existing VM or change forwarding while it
+is running, run `kitchen destroy` followed by `kitchen create`. Bridged
+networking, host-only adapters, IPv6 configuration and UDP forwarding are
+unsupported.
 
 ## Status and diagnostics
 
