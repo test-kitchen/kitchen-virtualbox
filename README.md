@@ -28,6 +28,13 @@ already has credentials, configure `transport.ssh_key` or
 `transport.password`. Set `insert_key: false` to leave key setup to the image.
 The `vboxmanage` driver option can point to a binary outside `PATH`.
 
+Set `driver.cpus` to the number of virtual processors and `driver.memory` to
+guest RAM in MB when importing a new VM. Both settings accept positive
+integers within VirtualBox 7.2's limits (1–64 CPUs and 4–2,097,152 MB).
+Omit either setting to retain the corresponding value from the image.
+Run `kitchen destroy` followed by
+`kitchen create` to change the hardware of an existing Kitchen VM.
+
 After adding a provisioner and suite, run `bundle exec kitchen test` from the
 Kitchen project. This driver requires Test Kitchen 4.2 or newer for the
 shared box catalog and cache API.
@@ -84,6 +91,14 @@ snapshot's disk chain. Keep the source VM, snapshot and disks in place until
 all linked clones have been destroyed. `kitchen destroy` removes the clone
 and its files. Run it before changing the source or snapshot for an existing
 Kitchen instance or cleaning up a failed creation.
+
+## Status and diagnostics
+
+Run `kitchen list --live` to see the state reported by VirtualBox for each
+managed VM. Add `--probe` to check transport connectivity as well.
+Run `kitchen doctor` to check host access and the configured VM source before
+creating an instance. These checks read the provider and local configuration
+without starting or modifying VMs.
 
 ## Apache smoke tests
 
