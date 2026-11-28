@@ -76,6 +76,14 @@ is running, run `kitchen destroy` followed by `kitchen create`. Bridged
 networking, host-only adapters, IPv6 configuration and UDP forwarding are
 unsupported.
 
+## Status and diagnostics
+
+Run `kitchen list --live` to see the state reported by VirtualBox for each
+managed VM. Add `--probe` to check transport connectivity as well.
+Run `kitchen doctor` to check host access and the configured VM source before
+creating an instance. These checks read the provider and local configuration
+without starting or modifying VMs.
+
 ## Apache smoke tests
 
 Mount the NAS or set `KITCHEN_BOX_MANIFEST` to a manifest containing the

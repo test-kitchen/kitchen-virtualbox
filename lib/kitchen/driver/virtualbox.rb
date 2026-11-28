@@ -12,6 +12,7 @@ require "mixlib/shellout" unless defined?(Mixlib::ShellOut)
 require "securerandom" unless defined?(SecureRandom)
 require "socket" unless defined?(Socket)
 require "tempfile" unless defined?(Tempfile)
+require "time" unless defined?(Time.zone_offset)
 require "tmpdir" unless defined?(Dir.mktmpdir)
 
 module Kitchen
@@ -63,7 +64,65 @@ module Kitchen
         release_box_source(state)
       end
 
+      def status(state)
+        id = state[:virtualbox_uuid]
+        unless id || state[:virtualbox_name]
+          return status_report(false, "not_created", "No managed VM is recorded for this instance")
+        end
+
+        registered = registered_uuid(state)
+        unless registered
+          return status_report(false, "not_created", "VirtualBox has no matching managed VM", id)
+        end
+
+        id = registered
+        vm_state = vm_info(id).fetch("VMState") { raise ActionFailed, "VBoxManage did not report VMState for #{id}" }
+        status_report(vm_state == "running", vm_state, "VirtualBox reports the VM as #{vm_state}", id)
+      rescue ActionFailed => e
+        status_report(nil, "unknown", e.message, id)
+      end
+
+      def doctor(_state)
+        checks = [-> { vbox("list", "vms") }, method(:validate_box)]
+        problems = checks.filter_map do |check|
+          check.call
+          nil
+        rescue ActionFailed, UserError => e
+          e.message
+        end
+        problems.each { |problem| warn(problem) }
+        !problems.empty?
+      end
+
       private
+
+      def status_report(live, state, message, id = nil)
+        { live: live, state: state, source: "driver", resource_id: id,
+          message: message, checked_at: Time.now.utc.iso8601 }
+      end
+
+      def validate_box
+        box = config[:box]
+        if box.is_a?(Hash)
+          manifest = config[:box_manifest] || ENV[Box::Catalog::ENV_KEY]
+          manifest = File.expand_path(manifest, config[:kitchen_root]) unless manifest.to_s.empty?
+          catalog = Box::Catalog.new(manifest)
+          entry = catalog.find(name: box[:name], version: box[:version], provider: "virtualbox")
+          Box::Cache.new(config[:box_cache]).validate_destination(catalog, entry)
+          catalog.verify(entry)
+        else
+          raise ActionFailed, "Set driver.box to a local path or a map with name and an exact version" unless box.is_a?(String) && !box.empty?
+
+          path = File.expand_path(box, config[:kitchen_root])
+          validate_box_path(path)
+        end
+      end
+
+      def validate_box_path(path)
+        return if File.file?(path) && File.readable?(path) && File.extname(path) == ".box"
+
+        raise ActionFailed, "VirtualBox driver.box must point to a readable local .box archive: #{path}"
+      end
 
       def prepare_state(state)
         return if state[:virtualbox_token]
@@ -99,9 +158,7 @@ module Kitchen
 
       def import_vm(state)
         source = box_source("virtualbox", state) { checkpoint(state) }
-        unless File.file?(source) && File.extname(source) == ".box"
-          raise ActionFailed, "VirtualBox driver.box must point to a local VirtualBox .box archive: #{source}"
-        end
+        validate_box_path(source)
 
         checkpoint(state) if state.delete(:virtualbox_uuid)
         directory = vm_directory(state)
