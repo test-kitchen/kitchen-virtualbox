@@ -37,8 +37,14 @@ when "sharedfolder"
     abort "unexpected sharedfolder action #{target}"
   end
 when "modifyvm"
-  rule = options.last
-  vm["forwarding"] = rule unless rule.start_with?("delete=")
+  flag = options.index("--nat-pf1")
+  rule = options.fetch(flag + 1)
+  if rule == "delete"
+    abort "unknown forwarding rule" unless vm.fetch("forwarding").split(",").first == options.fetch(flag + 2)
+    vm.delete("forwarding")
+  else
+    vm["forwarding"] = rule
+  end
 when "startvm"
   marker = File.join(File.dirname(registry_path), "fail-start-once")
   if File.exist?(marker)

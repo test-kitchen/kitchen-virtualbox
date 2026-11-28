@@ -53,6 +53,18 @@ class SharedFoldersTest < Minitest::Test
     assert_create_rejected(/Writable synced folders must not contain Kitchen's managed/)
   end
 
+  def test_rejects_writable_shares_overlapping_box_cache
+    host = File.join(@root, "share")
+    FileUtils.mkdir_p(host)
+    configure([["share", "/mnt/share"]])
+    path = File.join(@root, "kitchen.yml")
+    settings = YAML.safe_load_file(path)
+    settings.fetch("driver")["box_cache"] = File.join(host, "cache")
+    File.write(path, YAML.dump(settings))
+
+    assert_create_rejected(/Writable synced folders must not overlap Kitchen's box cache/)
+  end
+
   def test_create_retries_share_registration_and_destroy_preserves_host_data
     host = File.join(@root, "host share")
     FileUtils.mkdir_p(host)
@@ -76,6 +88,25 @@ class SharedFoldersTest < Minitest::Test
     assert_kitchen("destroy")
     refute File.exist?(@registry)
     assert_equal "host data", File.read(sentinel)
+  end
+
+  def test_removed_share_is_revoked_on_retry_without_removing_unrelated_mappings
+    FileUtils.mkdir_p(File.join(@root, "share"))
+    configure([["share", "/mnt/share"]])
+    File.write(File.join(@root, "fail-start-once"), "")
+    output, status = kitchen("create")
+    refute status.success?, output
+    assert_match(/simulated start failure/, output)
+    vm = JSON.parse(File.read(@registry))
+    assert_equal 1, vm.fetch("shares").size
+    vm.fetch("shares")["external-mapping"] = []
+    File.write(@registry, JSON.generate(vm))
+
+    configure(nil)
+    assert_kitchen("create")
+    assert_equal({ "external-mapping" => [] }, JSON.parse(File.read(@registry)).fetch("shares"))
+    assert_kitchen("destroy")
+    assert File.directory?(File.join(@root, "share"))
   end
 
   def test_default_configuration_registers_no_shares

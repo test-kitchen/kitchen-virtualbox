@@ -112,6 +112,14 @@ module Kitchen
           raise ActionFailed, "Writable synced folders must not contain Kitchen's managed .kitchen directory"
         end
 
+        unless readonly
+          cache_directory = canonical_host_path(Box::Cache.new(config[:box_cache]).root)
+          if source == cache_directory || source.start_with?(File.join(cache_directory, "")) ||
+              cache_directory.start_with?(File.join(source, ""))
+            raise ActionFailed, "Writable synced folders must not overlap Kitchen's box cache"
+          end
+        end
+
         { source: source, target: target, readonly: readonly, create: options[:create] }
       end
 
@@ -123,19 +131,30 @@ module Kitchen
         File.join(canonical_host_path(File.dirname(path)), File.basename(path))
       end
 
-      def configure_shared_folders(uuid, folders, info)
+      def configure_shared_folders(uuid, state, folders, info)
         existing = info.filter_map { |key, value| value if key.start_with?("SharedFolderNameMachineMapping") }
-        folders.each do |folder|
-          # A stable name lets a retry replace a share already registered on the VM.
-          name = "kitchen-#{Digest::SHA256.hexdigest(folder.fetch(:target))[0, 16]}"
-          if existing.include?(name)
-            vbox("sharedfolder", "remove", uuid, "--name=#{name}")
-          end
+        owned = Array(state[:virtualbox_managed_shares])
+        desired = folders.to_h do |folder|
+          ["kitchen-#{Digest::SHA256.hexdigest(folder.fetch(:target))[0, 16]}", folder]
+        end
+        collisions = (existing & desired.keys) - owned
+        unless collisions.empty?
+          raise ActionFailed, "VirtualBox shared folder name already exists: #{collisions.join(", ")}"
+        end
+        return if owned.empty? && desired.empty?
 
+        # Save both sets before changing the VM so a partial failure is retryable.
+        state[:virtualbox_managed_shares] = owned | desired.keys
+        checkpoint(state)
+        (existing & owned).each { |name| vbox("sharedfolder", "remove", uuid, "--name=#{name}") }
+
+        desired.each do |name, folder|
           arguments = ["--name=#{name}", "--hostpath=#{folder.fetch(:source)}", "--automount", "--auto-mount-point=#{folder.fetch(:target)}"]
           arguments << "--readonly" if folder.fetch(:readonly)
           vbox("sharedfolder", "add", uuid, *arguments)
         end
+        state[:virtualbox_managed_shares] = desired.keys
+        checkpoint(state)
       end
 
       def prepare_state(state)
@@ -202,9 +221,9 @@ module Kitchen
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
-          configure_shared_folders(uuid, folders, info) unless folders.empty?
+          configure_shared_folders(uuid, state, folders, info)
           forwarding.each do |rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{rule.split(",").first}")
+            vbox("modifyvm", uuid, "--nat-pf1", "delete", rule.split(",").first)
           end
           TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
           vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}")
