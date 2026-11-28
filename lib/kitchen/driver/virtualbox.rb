@@ -130,6 +130,7 @@ module Kitchen
         end
         clean_owned_media(state)
         FileUtils.rm_f(File.join(directory, "ssh_key"))
+        invalidate_key_history(state)
         Dir.rmdir(directory) if File.directory?(directory) && Dir.empty?(directory)
         release_box_source(state)
       end
