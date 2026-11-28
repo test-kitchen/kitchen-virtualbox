@@ -107,6 +107,83 @@ is running, run `kitchen destroy` followed by `kitchen create`. Bridged
 networking, host-only adapters, IPv6 configuration and UDP forwarding are
 unsupported.
 
+## Shared folders
+
+Use `driver.synced_folders` to mount host directories in a Linux
+guest. Each entry gives the host directory and the absolute guest mount path.
+Relative host paths resolve from the Kitchen project directory. Shares are
+writable by default. Set `readonly: true` on any share that should allow only reads.
+Set `create: true` to create a missing host directory and `disabled: true` to
+skip a share. Use `%{instance_name}` in a host path for per-instance directories.
+Use a dedicated directory for writable shares to keep Kitchen's state outside
+the guest's write access.
+
+```yaml
+driver:
+  name: virtualbox
+  synced_folders:
+    - ["./fixtures", "/mnt/fixtures", { readonly: true }]
+    - ["./results", "/mnt/results"]
+```
+
+Install VirtualBox Guest Additions with automount support in the guest. Use
+root or the permissions provided by the guest's `vboxsf` group to access
+the mounts. Run `kitchen destroy` and `kitchen create` to apply share changes
+to an existing instance. Destroy removes the VM and preserves the shared
+host directories and their contents.
+
+## Restore a snapshot
+
+Create the instance with `kitchen create` and use its `virtualbox_uuid` from
+`.kitchen/INSTANCE.yml` as `VM_UUID` below. Write a marker in the guest, then
+shut the guest down cleanly before taking the snapshot.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'echo baseline > ~/snapshot-marker'
+```
+
+```sh
+VBoxManage snapshot VM_UUID take baseline
+VBoxManage snapshot VM_UUID list --machinereadable
+VBoxManage startvm VM_UUID --type headless
+```
+
+Once SSH is ready, change the marker and shut the guest down cleanly again.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'echo changed > ~/snapshot-marker'
+```
+
+Use the listed snapshot UUID as `SNAPSHOT_UUID` to restore the guest disk.
+
+```sh
+bundle exec kitchen-virtualbox-restore INSTANCE SNAPSHOT_UUID
+bundle exec kitchen create INSTANCE
+```
+
+Once SSH is ready, verify that the guest contains the original marker.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'grep -qx baseline ~/snapshot-marker'
+```
+
+Run the restore command from the Kitchen project and supply the exact Kitchen
+instance name and VirtualBox snapshot UUID. The command checks which VM Kitchen
+owns and requires both the VM and the snapshot to be powered off. An unknown
+snapshot UUID leaves the VM and Kitchen state untouched. Restore rolls back
+guest disks and VM settings, including SSH forwarding, to the chosen snapshot.
+Restore refuses a snapshot that would reintroduce or change a shared folder
+using a Kitchen-generated name. Older snapshots can contain mappings that
+Kitchen no longer records as owned.
+
+The restore command leaves the VM off and invalidates Kitchen's saved SSH
+endpoint. Run `kitchen create INSTANCE` to refresh the forwarding rule and SSH
+credentials and reapply the configured shared folders before using
+`kitchen exec` or `kitchen login`. If restore is interrupted, retry it while the
+guest is powered off, or run `kitchen create` to reconnect to the guest in its
+current state. Avoid concurrent lifecycle commands for the same instance. `kitchen destroy` removes the managed VM and
+its snapshots.
+
 ## Status and diagnostics
 
 Run `kitchen list --live` to see the state reported by VirtualBox for each
