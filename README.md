@@ -77,6 +77,31 @@ shared folders, disables extra network adapters, USB controllers, remote
 display, clipboard sharing and drag-and-drop, and configures loopback SSH
 forwarding. Review any other host integrations on the template before using it.
 
+### Linked clones
+
+```yaml
+driver:
+  name: virtualbox
+  source_vm: Ubuntu 24.04 template
+  source_snapshot: clean install
+```
+
+Set `source_snapshot` to an existing snapshot name or UUID from the registered
+source VM. Use a trusted snapshot taken while the VM was powered off, and keep
+the source powered off during creation. If the snapshot is missing or contains
+saved runtime state, select a powered-off snapshot or create one in VirtualBox
+before retrying. Use the snapshot UUID if names are duplicated.
+
+Linked clones require `source_vm`. To use a box archive or catalog entry,
+remove `source_snapshot` and `source_vm` and configure `box`.
+Omit `source_snapshot` to make a full clone of the registered VM.
+
+The clone writes to its own differencing disks and depends on the source
+snapshot's disk chain. Keep the source VM, snapshot and disks in place until
+all linked clones have been destroyed. `kitchen destroy` removes the clone
+and its files. Run it before changing the source or snapshot for an existing
+Kitchen instance or cleaning up a failed creation.
+
 ## Networking
 
 By default, Kitchen uses a random loopback TCP port to reach the guest over SSH.
