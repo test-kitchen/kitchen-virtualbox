@@ -10,7 +10,7 @@ vm = JSON.parse(File.read(registry_path)) if File.exist?(registry_path)
 
 case command
 when "list"
-  puts %("#{vm.fetch("name")}" {#{uuid}}) if vm
+  puts %("#{vm.fetch("name")}" {#{uuid}}) if target == "vms" && vm
 when "import"
   abort "VM already registered" if vm
 
@@ -54,6 +54,10 @@ when "startvm"
   vm["state"] = "running"
 when "controlvm"
   vm["state"] = "poweroff"
+when "snapshot"
+  abort "unexpected snapshot command" unless target == uuid && options == %w{list --machinereadable}
+
+  puts "This machine does not have any snapshots"
 when "unregistervm"
   File.delete(registry_path)
   vm = nil
