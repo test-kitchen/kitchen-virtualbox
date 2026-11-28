@@ -1,0 +1,37 @@
+---
+<% require "json" %>
+driver:
+  name: virtualbox
+  box: <%= ENV.fetch("KITCHEN_VIRTUALBOX_WINDOWS_BOX").to_json %>
+  vboxmanage: <%= ENV.fetch("VBOXMANAGE", "VBoxManage").to_json %>
+
+transport:
+  name: winrm
+  username: <%= ENV.fetch("KITCHEN_WINRM_USERNAME").to_json %>
+  password: <%= ENV.fetch("KITCHEN_WINRM_PASSWORD").to_json %>
+  winrm_transport: <%= ENV.fetch("KITCHEN_WINRM_TRANSPORT", "negotiate").to_json %>
+  no_ssl_peer_verification: false
+<% if ENV.key?("KITCHEN_WINRM_PORT") %>
+  port: <%= Integer(ENV.fetch("KITCHEN_WINRM_PORT"), 10) %>
+<% end %>
+
+provisioner:
+  name: shell
+  command: >-
+    Set-Content -LiteralPath "$env:TEMP\kitchen-virtualbox-smoke.txt"
+    -Value "converged" -ErrorAction Stop
+
+verifier:
+  name: shell
+  remote_exec: true
+  command: >-
+    if ((Get-Content -LiteralPath "$env:TEMP\kitchen-virtualbox-smoke.txt"
+    -ErrorAction Stop) -ne "converged") { throw "Unexpected smoke marker" }
+
+platforms:
+  - name: windows
+    os_type: windows
+    shell_type: powershell
+
+suites:
+  - name: smoke

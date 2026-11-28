@@ -1,8 +1,8 @@
 # kitchen-virtualbox
 
-Run Test Kitchen against disposable Linux VirtualBox guests. This driver uses
-VirtualBox 7.2's `VBoxManage`, the box library in this Test Kitchen checkout and
-Kitchen's SSH transport.
+Run Test Kitchen against disposable Linux and Windows VirtualBox guests. This
+driver uses VirtualBox 7.2's `VBoxManage`, Test Kitchen's box library and
+Kitchen's SSH or WinRM transport.
 
 ```yaml
 driver:
@@ -19,9 +19,9 @@ platforms:
 
 Kitchen selects the VirtualBox archive for the host architecture and verifies
 its size and SHA-256 before importing `box.ovf`. A trusted local `.box` path can
-also be used directly. The archive should contain one Linux appliance.
+also be used directly. The archive should contain one appliance.
 
-The driver boots the imported VM headless and forwards its SSH port to a
+For Linux, the driver boots the imported VM headless and forwards its SSH port to a
 loopback port. Bento bootstrap uses the guest's `vagrant` account and
 VirtualBox Guest Additions to install a per-instance key. With an image that
 already has credentials, configure `transport.ssh_key` or
@@ -54,9 +54,81 @@ Catalog-backed boxes are copied to the local Kitchen cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
 
+## Windows over WinRM
+
+Use a trusted Windows VirtualBox `.box` with one enabled network adapter,
+an enabled WinRM listener and firewall rule, and a test account that can run
+PowerShell remoting. The box must boot headless on the host architecture.
+For example, use Windows Server 2022 x86-64 on a supported x86-64 host, or
+Windows 11 Arm64 on an Apple silicon Mac. See Oracle's
+[host and guest combinations](https://docs.oracle.com/en/virtualization/virtualbox/7.2/user/Introduction.html).
+
+To prepare a private smoke box on an Apple silicon Mac, install Windows 11 Pro
+from the [Microsoft Arm64 ISO](https://www.microsoft.com/en-us/software-download/windows11arm64)
+in a Windows 11 Arm VM with one NAT adapter. Use a dedicated local
+administrator with a unique password. From elevated Windows PowerShell,
+enable the WinRM listener with `Enable-PSRemoting -Force -SkipNetworkProfileCheck`.
+Keep the source on NAT without port forwards. Use the example's default
+`negotiate` transport and leave WinRM Basic authentication and unencrypted
+messages disabled. Detach the ISO and shut Windows down before exporting.
+
+Export into a new private directory and archive the OVF and its accompanying
+files. Keep the resulting box local because its disk contains the test account.
+
+```sh
+VBoxManage export W11-ARM-SMOKE --output box.ovf
+printf '%s\n' '{"provider":"virtualbox"}' > metadata.json
+tar -czf windows-arm64.box -- metadata.json box.ovf *.vmdk
+```
+
+Set `transport.name: winrm` and supply the image's credentials through
+Kitchen configuration. The driver uses NAT on the first adapter and replaces
+its imported port forwards with a WinRM forward bound to `127.0.0.1`. Kitchen
+chooses the guest port from the transport configuration (5985 for the default
+HTTP listener, 5986 for SSL, or `transport.port` for a custom listener).
+The image supplies authentication and listener settings.
+
+The Windows smoke suite writes and checks a marker file over WinRM. Set these
+environment variables and run it from the driver checkout.
+
+- `KITCHEN_VIRTUALBOX_WINDOWS_BOX` is the absolute path to the Windows box.
+- `KITCHEN_WINRM_USERNAME` and `KITCHEN_WINRM_PASSWORD` are the image credentials.
+- `KITCHEN_WINRM_TRANSPORT` optionally selects `ssl`. Use a certificate trusted
+  by Ruby on the host and valid for the loopback IP address `127.0.0.1`.
+  Keep `transport.no_ssl_peer_verification: false` explicit in your Kitchen
+  configuration to verify the server certificate.
+- `KITCHEN_WINRM_PORT` optionally supplies a non-default guest listener port.
+- `VBOXMANAGE` optionally selects the VirtualBox executable.
+
+```sh
+bundle install
+cd examples/windows
+bundle exec kitchen test --destroy always
+```
+
+To check recovery, export a disposable copy of the smoke box with the WinRM
+service disabled (`Set-Service WinRM -StartupType Disabled` in elevated
+PowerShell). Run `bundle exec kitchen create` with the normal credentials and
+wait for readiness to fail. Open the imported clone in the VirtualBox console
+and run the following in elevated PowerShell.
+
+```powershell
+Set-Service WinRM -StartupType Manual
+Start-Service WinRM
+winrm enumerate winrm/config/listener
+```
+
+Check that the expected listener is present, then rerun
+`bundle exec kitchen create` to reconnect to the same VM. Run
+`bundle exec kitchen converge`, `bundle exec kitchen verify` and
+`bundle exec kitchen destroy`. To test cleanup after a listener outage, run
+`bundle exec kitchen destroy` immediately after the failed create. Destroy
+the VM before changing the configured transport or guest listener port.
+
 ## Networking
 
 By default, Kitchen uses a random loopback TCP port to reach the guest over SSH.
+Private networks require the SSH transport.
 To expose another guest TCP service on the host and connect guests on a private
 VirtualBox internal network, configure either or both options:
 

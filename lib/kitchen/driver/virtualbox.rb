@@ -73,6 +73,10 @@ module Kitchen
 
         forward_ports = configured_forward_ports
         private_network, private_address = private_network_settings
+        if winrm? && private_network
+          raise ActionFailed, "VirtualBox private networking requires the SSH transport"
+        end
+
         folders = synced_folders
         prepare_state(state)
         uuid = if state[:virtualbox_restore_pending]
@@ -98,7 +102,7 @@ module Kitchen
         checkpoint(state) unless state[:virtualbox_restore_pending]
         attach_blank_disk(uuid, state, size) if size && !state[:virtualbox_restore_pending]
         ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
-        configure_ssh(uuid, state)
+        configure_ssh(uuid, state) unless winrm?
         connection = instance.transport.connection(state.except(:virtualbox_restore_pending))
         connection.wait_until_ready
         configure_private_address(connection, uuid, private_address) if private_address
@@ -620,18 +624,27 @@ module Kitchen
         host_port, forwarded_guest_port = forward_ports
         forward_rule = "kitchen-forward,tcp,127.0.0.1,#{host_port},,#{forwarded_guest_port}" if host_port
         info = vm_info(uuid)
+        winrm = winrm?
+        if winrm && info.any? { |key, value| /\Anic(?:[2-9]|[1-9]\d+)\z/.match?(key) && value != "none" }
+          raise ActionFailed, "VirtualBox WinRM requires a box with only its first network adapter enabled"
+        end
+
+        rule_name = winrm ? "kitchen-winrm" : "kitchen-ssh"
+        guest_port = instance.transport[:port] || 22
+        rule_prefix = "#{rule_name},tcp,127.0.0.1,"
         actual_network = info["intnet2"] if info["nic2"] == "intnet"
         verify_private_settings(state, actual_network, private_network, private_address)
         extra_adapters = info.keys.grep(/\Anic[3-8]\z/).reject { |key| info[key] == "none" }
         forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
         recovering = state[:virtualbox_restore_pending]
-        guest_port = instance.transport[:port] || 22
         if info.fetch("VMState") == "running"
-          rule = forwarding.find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
-          raise ActionFailed, "Running VirtualBox VM is missing its Kitchen SSH forwarding rule" unless rule
+          rule = forwarding.find { |value| value.start_with?(rule_prefix) }
+          unless rule && (!winrm || rule.end_with?(",,#{guest_port}"))
+            raise ActionFailed, "Running VirtualBox VM is missing its #{rule_name} forwarding rule for the configured transport. Run kitchen destroy before changing the transport or its guest port."
+          end
 
           port = Integer(rule.split(",").fetch(3))
-          if recovering && (state[:port] != port || info["nic1"] != "nat" || rule != "kitchen-ssh,tcp,127.0.0.1,#{port},,#{guest_port}")
+          if recovering && (state[:port] != port || info["nic1"] != "nat" || rule != "#{rule_prefix}#{port},,#{guest_port}")
             raise ActionFailed, "Shut down the restored VirtualBox VM before running kitchen create"
           end
 
@@ -652,7 +665,7 @@ module Kitchen
           forwarding.each do |existing_rule|
             vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
           end
-          options = ["--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{guest_port}"]
+          options = ["--nic1", "nat", "--nat-pf1", "#{rule_prefix}#{state[:port]},,#{guest_port}"]
           options.push("--nat-pf1", forward_rule) if forward_rule
           vbox("modifyvm", uuid, *options)
           if private_network
@@ -723,6 +736,10 @@ module Kitchen
           echo "VirtualBox private adapter #{formatted_mac} is missing in the guest" >&2
           exit 1
         SH
+      end
+
+      def winrm?
+        defined?(Kitchen::Transport::Winrm) && instance.transport.is_a?(Kitchen::Transport::Winrm)
       end
 
       def configure_ssh(uuid, state)
