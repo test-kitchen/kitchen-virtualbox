@@ -11,6 +11,7 @@ require "mixlib/shellout" unless defined?(Mixlib::ShellOut)
 require "securerandom" unless defined?(SecureRandom)
 require "socket" unless defined?(Socket)
 require "tempfile" unless defined?(Tempfile)
+require "time" unless defined?(Time.zone_offset)
 require "tmpdir" unless defined?(Dir.mktmpdir)
 
 module Kitchen
@@ -22,17 +23,22 @@ module Kitchen
       default_config :box
       default_config :box_manifest
       default_config :box_cache
+      default_config :cpus
+      default_config :memory
       default_config :source_vm
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
 
+      # VBoxManage's guest limits on the 64-bit hosts supported by VirtualBox 7.2.
+      HARDWARE_LIMITS = { cpus: (1..64), memory: (4..2_097_152) }.freeze
+      private_constant :HARDWARE_LIMITS
+
       include Box::Source
 
       def create(state)
+        validate_hardware
         source = config[:source_vm]
-        unless source.nil? || (source.is_a?(String) && !source.strip.empty? && config[:box].nil?)
-          raise ActionFailed, "Set driver.source_vm to a registered VirtualBox VM name or UUID without driver.box"
-        end
+        validate_source_vm(source)
 
         prepare_state(state)
         uuid = registered_uuid(state) || (source ? clone_vm(source, state) : import_vm(state))
@@ -61,7 +67,92 @@ module Kitchen
         release_box_source(state)
       end
 
+      def status(state)
+        id = state[:virtualbox_uuid]
+        unless id || state[:virtualbox_name]
+          return status_report(false, "not_created", "No managed VM is recorded for this instance")
+        end
+
+        registered = registered_uuid(state)
+        unless registered
+          return status_report(false, "not_created", "VirtualBox has no matching managed VM", id)
+        end
+
+        id = registered
+        vm_state = vm_info(id).fetch("VMState") { raise ActionFailed, "VBoxManage did not report VMState for #{id}" }
+        status_report(vm_state == "running", vm_state, "VirtualBox reports the VM as #{vm_state}", id)
+      rescue ActionFailed => e
+        status_report(nil, "unknown", e.message, id)
+      end
+
+      def doctor(_state)
+        checks = [-> { vbox("list", "vms") }, method(:validate_vm_source)]
+        problems = checks.filter_map do |check|
+          check.call
+          nil
+        rescue ActionFailed, UserError => e
+          e.message
+        end
+        problems.each { |problem| warn(problem) }
+        !problems.empty?
+      end
+
       private
+
+      def validate_hardware
+        HARDWARE_LIMITS.each do |setting, range|
+          value = config[setting]
+          next if value.nil?
+
+          unless value.is_a?(Integer) && value > 0
+            raise ActionFailed, "driver.#{setting} must be a positive integer"
+          end
+
+          unless range.cover?(value)
+            raise ActionFailed, "driver.#{setting} must be within VirtualBox's supported range (#{range})"
+          end
+        end
+      end
+
+      def status_report(live, state, message, id = nil)
+        { live: live, state: state, source: "driver", resource_id: id,
+          message: message, checked_at: Time.now.utc.iso8601 }
+      end
+
+      def validate_vm_source
+        source = config[:source_vm]
+        validate_source_vm(source)
+        source.nil? ? validate_box : powered_off_source_uuid(source)
+      end
+
+      def validate_source_vm(source)
+        unless source.nil? || (source.is_a?(String) && !source.strip.empty? && config[:box].nil?)
+          raise ActionFailed, "Set driver.source_vm to a registered VirtualBox VM name or UUID without driver.box"
+        end
+      end
+
+      def validate_box
+        box = config[:box]
+        if box.is_a?(Hash)
+          manifest = config[:box_manifest] || ENV[Box::Catalog::ENV_KEY]
+          manifest = File.expand_path(manifest, config[:kitchen_root]) unless manifest.to_s.empty?
+          catalog = Box::Catalog.new(manifest)
+          entry = catalog.find(name: box[:name], version: box[:version], provider: "virtualbox")
+          Box::Cache.new(config[:box_cache]).validate_destination(catalog, entry)
+          catalog.verify(entry)
+        else
+          raise ActionFailed, "Set driver.box to a local path or a map with name and an exact version" unless box.is_a?(String) && !box.empty?
+
+          path = File.expand_path(box, config[:kitchen_root])
+          validate_box_path(path)
+        end
+      end
+
+      def validate_box_path(path)
+        return if File.file?(path) && File.readable?(path) && File.extname(path) == ".box"
+
+        raise ActionFailed, "VirtualBox driver.box must point to a readable local .box archive: #{path}"
+      end
 
       def prepare_state(state)
         return if state[:virtualbox_token]
@@ -98,7 +189,7 @@ module Kitchen
         end
       end
 
-      def clone_vm(source, state)
+      def powered_off_source_uuid(source)
         vms = registered_vms
         source_vm = vms.find { |_, uuid| uuid.casecmp?(source) } || vms.find { |name, _| name == source }
         raise ActionFailed, "VirtualBox source VM is not registered: #{source}" unless source_vm
@@ -109,6 +200,11 @@ module Kitchen
           raise ActionFailed, "VirtualBox source VM #{source.inspect} must be powered off (current state: #{status})"
         end
 
+        source_uuid
+      end
+
+      def clone_vm(source, state)
+        source_uuid = powered_off_source_uuid(source)
         clone_uuid = state.fetch(:virtualbox_token)
         if state[:virtualbox_uuid] != clone_uuid
           state[:virtualbox_uuid] = clone_uuid
@@ -123,9 +219,7 @@ module Kitchen
 
       def import_vm(state)
         source = box_source("virtualbox", state) { checkpoint(state) }
-        unless File.file?(source) && File.extname(source) == ".box"
-          raise ActionFailed, "VirtualBox driver.box must point to a local VirtualBox .box archive: #{source}"
-        end
+        validate_box_path(source)
 
         checkpoint(state) if state.delete(:virtualbox_uuid)
         directory = vm_directory(state)
@@ -137,7 +231,10 @@ module Kitchen
             raise ActionFailed, "VirtualBox box is missing a regular box.ovf: #{source}"
           end
 
-          vbox("import", appliance, "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory)
+          hardware = HARDWARE_LIMITS.keys.flat_map do |setting|
+            config[setting] ? ["--#{setting}", config[setting].to_s] : []
+          end
+          vbox("import", appliance, "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory, *hardware)
         end
         registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
       rescue Box::LocalArchive::InvalidBox => e

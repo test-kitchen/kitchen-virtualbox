@@ -16,4 +16,5 @@ Gem::Specification.new do |gem|
   gem.required_ruby_version = ">= 3.1"
   gem.add_dependency "mixlib-shellout", ">= 3.0", "< 4.0"
   gem.add_dependency "test-kitchen", "~> 4.2"
+  gem.add_development_dependency "minitest", "~> 5.0"
 end
