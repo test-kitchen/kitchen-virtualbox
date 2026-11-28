@@ -80,6 +80,10 @@ module Kitchen
         private_network, private_address = private_network_settings
         folders = synced_folders
         prepare_state(state)
+        if source.nil? && state[:virtualbox_uuid] == state[:virtualbox_token]
+          raise ActionFailed, "Run kitchen destroy before switching from a registered VirtualBox clone to a box."
+        end
+
         verify_clone_request(source, snapshot, state)
         uuid = if state[:virtualbox_restore_pending]
                  managed_vm_info(state).fetch("UUID")
@@ -108,8 +112,9 @@ module Kitchen
         state[:virtualbox_uuid] = uuid
         checkpoint(state) unless state[:virtualbox_restore_pending]
         attach_blank_disk(uuid, state, size) if size && !state[:virtualbox_restore_pending]
-        ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
-        record_linked_clone_artifacts(uuid, state) if state[:virtualbox_linked_clone]
+        with_linked_clone_artifacts(uuid, state) do
+          ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
+        end
         configure_ssh(uuid, state)
         connection = instance.transport.connection(state.except(:virtualbox_restore_pending))
         connection.wait_until_ready
@@ -132,6 +137,7 @@ module Kitchen
 
           if state[:virtualbox_linked_clone]
             record_linked_clone_media(uuid, state)
+            record_linked_clone_artifacts(uuid, state) unless state.key?(:virtualbox_linked_artifacts)
             disks = hard_disks
             state.fetch(:virtualbox_linked_media).each do |chain, identity|
               verify_linked_disk(chain, identity, directory, disks)
@@ -662,8 +668,23 @@ module Kitchen
         [stat.dev, stat.ino]
       end
 
+      def with_linked_clone_artifacts(uuid, state)
+        return yield unless state[:virtualbox_linked_clone]
+
+        record_linked_clone_artifacts(uuid, state) unless state.key?(:virtualbox_linked_artifacts)
+        tracked = linked_config_artifacts(vm_info(uuid)["CfgFile"], state)
+        begin
+          yield
+        ensure
+          refresh_linked_config_artifacts(uuid, state, tracked)
+          unless state[:virtualbox_linked_start_attempted]
+            state[:virtualbox_linked_start_attempted] = true
+            record_linked_clone_artifacts(uuid, state)
+          end
+        end
+      end
+
       def record_linked_clone_artifacts(uuid, state)
-        return if state.key?(:virtualbox_linked_artifacts)
 
         directory = vm_directory(state)
         info = vm_info(uuid)
@@ -675,15 +696,15 @@ module Kitchen
           files.concat(Dir.glob("VBox.log{,.[0-9]*}", base: logs).map { |name| File.join(logs, name) })
         end
 
-        artifacts = {}
+        artifacts = Array(state[:virtualbox_linked_artifacts]).to_h
         files.each do |file|
           path = canonical_disk_path(file)
           next unless inside_directory?(path, directory) && File.file?(file) && !File.symlink?(file)
 
-          artifacts[path] = disk_file_identity(path)
+          artifacts[path] ||= disk_file_identity(path)
           parent = File.dirname(path)
           while inside_directory?(parent, directory)
-            artifacts[parent] = disk_file_identity(parent)
+            artifacts[parent] ||= disk_file_identity(parent)
             parent = File.dirname(parent)
           end
         end

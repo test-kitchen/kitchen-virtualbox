@@ -96,6 +96,20 @@ class RegisteredSourceTest < Minitest::Test
     assert_equal shares, registry.fetch(uuid).fetch("managed_shares")
   end
 
+  def test_cannot_switch_a_registered_clone_to_an_imported_box
+    assert_kitchen "create"
+    current = registry
+    File.write(@configuration, File.read(@configuration).sub("source_vm: Disposable source", "box: replacement.box"))
+
+    [current, current.select { |id, _| id == SOURCE }].each do |registered|
+      File.write(@registry, JSON.generate(registered))
+      output, status = kitchen("create")
+      refute status.success?, output
+      assert_match(/Run kitchen destroy before switching/, output)
+      assert_equal registered, registry
+    end
+  end
+
   def test_missing_clone_requires_cleanup_before_recreating
     assert_kitchen "create"
     original_source = registry.fetch(SOURCE)
@@ -132,6 +146,20 @@ class RegisteredSourceTest < Minitest::Test
     output, status = kitchen("create")
     refute status.success?, output
     assert_match(/Run kitchen destroy before recreating/, output)
+  end
+
+  def test_destroy_cleans_up_a_linked_clone_after_failed_creation
+    source = configure_linked_clone
+    File.write(File.join(@root, "fail_clone_once"), "")
+    output, status = kitchen("create")
+    refute status.success?, output
+    assert_match(/simulated clone failure/, output)
+    uuid, clone = registry.find { |id, _| id != SOURCE }
+    assert File.file?(clone.fetch("config"))
+
+    assert_kitchen "destroy"
+    assert_equal({ SOURCE => source }, registry)
+    refute File.exist?(File.join(@root, ".kitchen", "virtualbox-#{uuid}"))
   end
 
   def test_destroy_preserves_a_replacement_clone_configuration
