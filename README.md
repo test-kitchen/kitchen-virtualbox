@@ -37,6 +37,29 @@ Catalog-backed boxes are copied to the local Kitchen cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
 
+## Clone a registered VirtualBox VM
+
+```yaml
+driver:
+  name: virtualbox
+  source_vm: Ubuntu 24.04 template
+```
+
+Set `source_vm` to the exact name or UUID of a registered, powered-off VM
+instead of setting `box`. Keep the source powered off while Kitchen creates
+the full clone. Kitchen starts the clone and removes only the clone on
+`kitchen destroy`. If VirtualBox leaves files after a failed clone, run
+`kitchen destroy` before retrying.
+
+For templates without the Bento guest bootstrap setup, configure
+`transport.ssh_key` or `transport.password` for an existing SSH user.
+
+Use a trusted template with test data and credentials. The clone copies the
+guest disk, including any credentials stored in it. Kitchen removes inherited
+shared folders, disables extra network adapters, USB controllers, remote
+display, clipboard sharing and drag-and-drop, and configures loopback SSH
+forwarding. Review any other host integrations on the template before using it.
+
 ## Apache smoke tests
 
 Mount the NAS or set `KITCHEN_BOX_MANIFEST` to a manifest containing the

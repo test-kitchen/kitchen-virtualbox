@@ -22,14 +22,20 @@ module Kitchen
       default_config :box
       default_config :box_manifest
       default_config :box_cache
+      default_config :source_vm
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
 
       include Box::Source
 
       def create(state)
+        source = config[:source_vm]
+        unless source.nil? || (source.is_a?(String) && !source.strip.empty? && config[:box].nil?)
+          raise ActionFailed, "Set driver.source_vm to a registered VirtualBox VM name or UUID without driver.box"
+        end
+
         prepare_state(state)
-        uuid = registered_uuid(state) || import_vm(state)
+        uuid = registered_uuid(state) || (source ? clone_vm(source, state) : import_vm(state))
         state[:virtualbox_uuid] = uuid
         checkpoint(state)
         ensure_running(uuid, state)
@@ -62,6 +68,7 @@ module Kitchen
 
         state[:virtualbox_token] = SecureRandom.uuid
         state[:virtualbox_name] = "kitchen-#{instance.name}-#{state[:virtualbox_token]}"
+        state[:virtualbox_uuid] = state[:virtualbox_token] if config[:source_vm]
         checkpoint(state)
       end
 
@@ -79,14 +86,39 @@ module Kitchen
       end
 
       def registered_uuid(state)
-        vbox("list", "vms").each_line do |line|
-          entry = /\A"(.*)" \{([0-9a-f-]+)\}\s*\z/i.match(line)
-          next unless entry
+        registered_vms.find do |name, uuid|
+          state[:virtualbox_uuid] ? uuid == state[:virtualbox_uuid] : name == state[:virtualbox_name]
+        end&.last
+      end
 
-          name, uuid = entry.captures
-          return uuid if state[:virtualbox_uuid] ? uuid == state[:virtualbox_uuid] : name == state[:virtualbox_name]
+      def registered_vms
+        vbox("list", "vms").each_line.filter_map do |line|
+          entry = /\A"(.*)" \{([0-9a-f-]+)\}\s*\z/i.match(line)
+          entry&.captures
         end
-        nil
+      end
+
+      def clone_vm(source, state)
+        vms = registered_vms
+        source_vm = vms.find { |_, uuid| uuid.casecmp?(source) } || vms.find { |name, _| name == source }
+        raise ActionFailed, "VirtualBox source VM is not registered: #{source}" unless source_vm
+
+        source_uuid = source_vm.last
+        status = vm_info(source_uuid).fetch("VMState")
+        unless status == "poweroff"
+          raise ActionFailed, "VirtualBox source VM #{source.inspect} must be powered off (current state: #{status})"
+        end
+
+        clone_uuid = state.fetch(:virtualbox_token)
+        if state[:virtualbox_uuid] != clone_uuid
+          state[:virtualbox_uuid] = clone_uuid
+          checkpoint(state)
+        end
+        directory = vm_directory(state)
+        FileUtils.mkdir_p(directory, mode: 0o700)
+        vbox("clonevm", source_uuid, "--mode", "machine", "--name", state.fetch(:virtualbox_name),
+          "--uuid", clone_uuid, "--basefolder", directory, "--register")
+        registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
       end
 
       def import_vm(state)
@@ -121,6 +153,8 @@ module Kitchen
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
+          # Registered-source clones use the Kitchen token as their VM UUID.
+          isolate_clone(uuid, info) if uuid == state[:virtualbox_token]
           forwarding.each do |rule|
             vbox("modifyvm", uuid, "--nat-pf1", "delete=#{rule.split(",").first}")
           end
@@ -129,6 +163,19 @@ module Kitchen
           vbox("startvm", uuid, "--type", "headless")
         end
         state[:hostname] = "127.0.0.1"
+      end
+
+      def isolate_clone(uuid, info)
+        options = %w{--vrde off --clipboard-mode disabled --drag-and-drop disabled
+          --usb-ohci off --usb-ehci off --usb-xhci off --nic-trace1 off}
+        info.each do |key, value|
+          if (adapter = /\Anic([0-9]+)\z/.match(key))
+            options.push("--#{key}", "none") if adapter[1].to_i > 1 && value != "none"
+          elsif key.start_with?("SharedFolderNameMachineMapping")
+            vbox("sharedfolder", "remove", uuid, "--name", value)
+          end
+        end
+        vbox("modifyvm", uuid, *options)
       end
 
       def configure_ssh(uuid, state)
