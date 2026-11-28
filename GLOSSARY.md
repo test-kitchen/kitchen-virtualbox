@@ -2,10 +2,10 @@
 
 ## Language
 
-- **Source image**. A VirtualBox appliance in a box archive or a registered VM selected for cloning.
+- **Source image**. A VirtualBox appliance in a box archive. The 1.0 plan also includes cloning a registered source VM.
 - **Instance**. A Kitchen suite and platform pairing with its own disposable VM and lifecycle state. Multiple instances can use the same **Source image**.
-- **Owned resource**. A resource created for one **Instance** and tracked for its cleanup, such as its imported or cloned VM, per-instance SSH key or additional blank disk.
-- **Lifecycle**. The Kitchen actions that create, prepare, verify and destroy an **Instance**. Its state lets a later action recover work from a partial run.
+- **Owned resource**. A resource created for one **Instance** and tracked for its cleanup, such as its imported VM or per-instance SSH key. The 1.0 plan also includes blank test disks.
+- **Lifecycle**. The Kitchen actions `create`, `converge`, `setup`, `verify` and `destroy`. An instance's saved state lets a later action recover work from a partial run.
 - **Verified box**. A catalog archive pinned by name and version, selected for the provider and host architecture, whose size and SHA-256 match the catalog before import.
 
 ## Coding and review standards
