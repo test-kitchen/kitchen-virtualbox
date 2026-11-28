@@ -8,6 +8,7 @@ require "kitchen/box/source"
 require "kitchen/box/ssh_bootstrap"
 require "kitchen/state_file"
 require "mixlib/shellout" unless defined?(Mixlib::ShellOut)
+require "rexml/document" unless defined?(REXML::Document)
 require "securerandom" unless defined?(SecureRandom)
 require "socket" unless defined?(Socket)
 require "tempfile" unless defined?(Tempfile)
@@ -25,24 +26,48 @@ module Kitchen
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
 
-      UUID_PATTERN = /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/
+      UUID_PATTERN = /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/.freeze
 
       include Box::Source
 
+      module RestoreTransportGuard
+        def connection(state, &block)
+          if state[:virtualbox_restore_pending]
+            raise ActionFailed, "Run kitchen create before connecting to the restored VirtualBox VM"
+          end
+
+          super
+        end
+      end
+
+      def finalize_config!(instance)
+        super
+        instance.transport.singleton_class.prepend(RestoreTransportGuard)
+        self
+      end
+
       def create(state)
         prepare_state(state)
-        uuid = registered_uuid(state) || import_vm(state)
+        uuid = if state[:virtualbox_restore_pending]
+                 managed_vm_info(state).fetch("UUID")
+               else
+                 registered_uuid(state) || import_vm(state)
+               end
         state[:virtualbox_uuid] = uuid
-        checkpoint(state)
+        checkpoint(state) unless state[:virtualbox_restore_pending]
         ensure_running(uuid, state)
         configure_ssh(uuid, state)
-        instance.transport.connection(state).wait_until_ready
+        connection_state = state.except(:virtualbox_restore_pending)
+        instance.transport.connection(connection_state).wait_until_ready
+        state.delete(:virtualbox_restore_pending)
       end
 
       def destroy(state)
         return unless state[:virtualbox_token]
 
-        if (uuid = registered_uuid(state))
+        uuid = registered_uuid(state)
+        managed_vm_info(state) if uuid && state[:virtualbox_restore_pending]
+        if uuid
           status = vm_info(uuid).fetch("VMState")
           case status
           when "running", "paused", "stuck"
@@ -61,7 +86,21 @@ module Kitchen
         snapshot = snapshot.to_s.downcase
         raise ActionFailed, "Provide a VirtualBox snapshot UUID" unless UUID_PATTERN.match?(snapshot)
 
-        state = StateFile.new(config[:kitchen_root], instance.name).read
+        state = state_file.read
+        info = managed_vm_info(state)
+        raise ActionFailed, "The managed VirtualBox VM must be powered off before restoring a snapshot" unless info["VMState"] == "poweroff"
+
+        verify_offline_snapshot(info.fetch("CfgFile"), snapshot)
+
+        %i{hostname port last_action}.each { |key| state.delete(key) }
+        state[:virtualbox_restore_pending] = true
+        checkpoint_restore(state)
+        vbox("snapshot", info.fetch("UUID"), "restore", snapshot)
+      end
+
+      private
+
+      def managed_vm_info(state)
         uuid = state[:virtualbox_uuid]
         unless uuid.is_a?(String) && UUID_PATTERN.match?(uuid) && state[:virtualbox_token]
           raise ActionFailed, "No Kitchen-managed VirtualBox VM recorded for #{instance.name}"
@@ -71,24 +110,25 @@ module Kitchen
         unless info["UUID"] == uuid && info["name"] == vm_name(state) && managed_config_path?(state, info["CfgFile"])
           raise ActionFailed, "Could not verify the Kitchen-managed VirtualBox VM for #{instance.name}"
         end
-        raise ActionFailed, "The managed VirtualBox VM must be powered off before restoring a snapshot" unless info["VMState"] == "poweroff"
 
-        snapshots = vbox("snapshot", uuid, "list", "--machinereadable")
-        unless snapshots.each_line.any? { |line| /\ASnapshotUUID(?:-[0-9]+)*="#{snapshot}"\s*\z/i.match?(line) }
-          raise ActionFailed, "Snapshot does not exist on #{instance.name}: #{snapshot}"
-        end
-
-        vbox("snapshot", uuid, "restore", snapshot)
+        info
       end
 
-      private
+      def verify_offline_snapshot(path, snapshot)
+        # VBoxManage snapshot showvminfo reports the current VM power state.
+        settings = REXML::Document.new(File.binread(path))
+        entry = settings.get_elements("//Snapshot").find { |node| node.attributes["uuid"]&.casecmp?("{#{snapshot}}") }
+        raise ActionFailed, "Snapshot does not exist on #{instance.name}: #{snapshot}" unless entry
+        raise ActionFailed, "Take the VirtualBox snapshot while the guest is powered off" if entry.attributes["stateFile"]
+      rescue REXML::ParseException, SystemCallError
+        raise ActionFailed, "Could not read VirtualBox snapshot settings for #{instance.name}"
+      end
 
       def managed_config_path?(state, path)
         return false unless path && File.file?(path)
 
         directory = vm_directory(state)
-        expected = File.join(File.realpath(config[:kitchen_root]), ".kitchen", File.basename(directory))
-        File.realpath(directory) == expected && File.realpath(path).start_with?("#{expected}#{File::SEPARATOR}")
+        File.realpath(directory) == directory && File.realpath(path).start_with?("#{directory}#{File::SEPARATOR}")
       rescue SystemCallError
         false
       end
@@ -106,7 +146,20 @@ module Kitchen
       end
 
       def checkpoint(state)
-        StateFile.new(config[:kitchen_root], instance.name).write(state)
+        state_file.write(state)
+      end
+
+      def state_file
+        StateFile.new(config[:kitchen_root], instance.name)
+      end
+
+      def checkpoint_restore(state)
+        path = state_file.path
+        Tempfile.create(".virtualbox-restore-", File.dirname(path)) do |file|
+          file.write(YAML.dump(Util.stringified_hash(state)))
+          file.fsync
+          File.rename(file.path, path)
+        end
       end
 
       def vm_directory(state)
@@ -115,7 +168,7 @@ module Kitchen
           raise ActionFailed, "Invalid VirtualBox instance ID in Kitchen state"
         end
 
-        File.join(config[:kitchen_root], ".kitchen", "virtualbox-#{token}")
+        File.join(File.realpath(File.dirname(state_file.path)), "virtualbox-#{token}")
       end
 
       def registered_uuid(state)
@@ -155,17 +208,29 @@ module Kitchen
       def ensure_running(uuid, state)
         info = vm_info(uuid)
         forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
+        recovering = state[:virtualbox_restore_pending]
+        guest_port = instance.transport[:port] || 22
         if info.fetch("VMState") == "running"
           rule = forwarding.find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
           raise ActionFailed, "Running VirtualBox VM is missing its Kitchen SSH forwarding rule" unless rule
 
-          state[:port] = Integer(rule.split(",").fetch(3))
+          port = Integer(rule.split(",").fetch(3))
+          if recovering && (state[:port] != port || info["nic1"] != "nat" || rule != "kitchen-ssh,tcp,127.0.0.1,#{port},,#{guest_port}")
+            raise ActionFailed, "Shut down the restored VirtualBox VM before running kitchen create"
+          end
+
+          state[:port] = port
         else
+          if recovering && info["VMState"] != "poweroff"
+            raise ActionFailed, "Shut down the restored VirtualBox VM before running kitchen create"
+          end
+
           forwarding.each do |existing_rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{existing_rule.split(",").first}")
+            vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
           end
           TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
-          vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}")
+          vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{guest_port}")
+          checkpoint_restore(state) if recovering
           vbox("startvm", uuid, "--type", "headless")
         end
         state[:hostname] = "127.0.0.1"

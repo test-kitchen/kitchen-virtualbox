@@ -63,7 +63,7 @@ Use the listed snapshot UUID as `SNAPSHOT_UUID` to restore the guest disk.
 
 ```sh
 bundle exec kitchen-virtualbox-restore INSTANCE SNAPSHOT_UUID
-VBoxManage startvm VM_UUID --type headless
+bundle exec kitchen create INSTANCE
 ```
 
 Once SSH is ready, verify that the guest contains the original marker.
@@ -74,15 +74,17 @@ bundle exec kitchen exec INSTANCE -c 'grep -qx baseline ~/snapshot-marker'
 
 Run the restore command from the Kitchen project and supply the exact Kitchen
 instance name and VirtualBox snapshot UUID. The command checks which VM Kitchen
-owns and requires it to be powered off. An unknown snapshot UUID leaves the VM
-unchanged. Restore rolls back guest disks and VM settings, including SSH
-forwarding, to the chosen snapshot. Kitchen's local state stays as it was, so
-use a snapshot from the same instance with its current SSH settings.
+owns and requires both the VM and the snapshot to be powered off. An unknown
+snapshot UUID leaves the VM and Kitchen state untouched. Restore rolls back
+guest disks and VM settings, including SSH forwarding, to the chosen snapshot.
 
-The workflow supports snapshots taken with the guest powered off. It never
-starts the VM automatically. Shut down the guest before restoring again and
-avoid concurrent lifecycle commands for the same instance. Snapshots belong to
-the managed VM and are removed by `kitchen destroy`.
+The restore command leaves the VM off and invalidates Kitchen's saved SSH
+endpoint. Run `kitchen create INSTANCE` to refresh the forwarding rule and SSH
+credentials before using `kitchen exec` or `kitchen login`. If restore is
+interrupted, retry it while the guest is powered off, or run `kitchen create`
+to reconnect to the guest in its current state. Avoid concurrent lifecycle
+commands for the same instance. `kitchen destroy` removes the managed VM and
+its snapshots.
 
 ## Apache smoke tests
 
