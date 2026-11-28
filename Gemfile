@@ -6,6 +6,7 @@ end
 
 gemspec development_group: :test
 
+gem "minitest", "~> 5.0"
 gem "rake"
 
 group :cookstyle do
