@@ -40,7 +40,9 @@ module Kitchen
         end
 
         prepare_state(state)
+        verify_clone_request(source, snapshot, state)
         uuid = registered_uuid(state) || (source ? clone_vm(source, snapshot, state) : import_vm(state))
+        record_linked_clone_media(uuid, state) if state[:virtualbox_linked_clone]
         state[:virtualbox_uuid] = uuid
         checkpoint(state)
         ensure_running(uuid, state)
@@ -51,7 +53,17 @@ module Kitchen
       def destroy(state)
         return unless state[:virtualbox_token]
 
+        directory = vm_directory(state)
         if (uuid = registered_uuid(state))
+          if state[:virtualbox_linked_clone]
+            record_linked_clone_media(uuid, state)
+            disks = hard_disks
+            state.fetch(:virtualbox_linked_media).each do |chain, identity|
+              verify_linked_disk(chain, identity, directory, disks)
+            end
+            state[:virtualbox_destroying] = true
+            checkpoint(state)
+          end
           status = vm_info(uuid).fetch("VMState")
           case status
           when "running", "paused", "stuck"
@@ -63,25 +75,145 @@ module Kitchen
           options = state[:virtualbox_linked_clone] ? [] : ["--delete"]
           vbox("unregistervm", uuid, *options)
         end
-        directory = vm_directory(state)
-        close_linked_clone_media(directory) if state[:virtualbox_linked_clone] && File.directory?(directory) && !File.symlink?(directory)
-        FileUtils.remove_entry_secure(directory) if File.exist?(directory)
+        if state[:virtualbox_linked_clone]
+          close_linked_clone_media(directory, state)
+        elsif File.directory?(directory)
+          FileUtils.remove_entry_secure(directory)
+        end
         release_box_source(state)
       end
 
       private
 
-      def close_linked_clone_media(directory)
-        prefix = "#{File.realpath(directory)}/"
-        vbox("list", "hdds").split(/\n\s*\n/).reverse_each do |entry|
-          path = entry[/^Location:[ \t]+(.+)$/, 1]
-          next unless path&.start_with?(prefix)
-          next if File.exist?(path) && File.realpath(path) != path
+      def hard_disks
+        vbox("list", "hdds").split(/\n\s*\n/).to_h do |entry|
+          uuid = entry[/^UUID:[ \t]+([0-9a-f-]+)$/i, 1]
+          parent = entry[/^Parent UUID:[ \t]+(\S+)$/, 1]
+          location = entry[/^Location:[ \t]+(.+)$/, 1]
+          raise ActionFailed, "VirtualBox returned an incomplete hard disk record" unless uuid && parent && location
 
-          uuid = entry[/^UUID:[ \t]+([0-9a-f-]+)$/, 1]
-          raise ActionFailed, "VirtualBox did not report a UUID for clone disk #{path}" unless uuid
+          [uuid.downcase, [canonical_disk_path(location), parent.downcase, location]]
+        end
+      end
 
-          vbox("closemedium", "disk", uuid)
+      def canonical_disk_path(path)
+        File.realpath(path)
+      rescue SystemCallError
+        nil
+      end
+
+      def record_linked_clone_media(uuid, state)
+        return if state[:virtualbox_linked_media]
+
+        existing = state[:virtualbox_existing_disks]
+        raise ActionFailed, "VirtualBox linked clone state is missing its original disk inventory" unless existing
+
+        directory = vm_directory(state)
+        disks = hard_disks
+        info = vm_info(uuid)
+        image_ids = info.filter_map { |key, id| id.downcase if /-ImageUUID-\d+-\d+"?\z/.match?(key) && id }
+        owned = (image_ids.uniq & disks.keys) - existing
+        raise ActionFailed, "VirtualBox did not report a linked clone disk" if owned.empty?
+
+        state[:virtualbox_linked_media] = owned.map do |id|
+          path, parent = disks.fetch(id)
+          unless inside_directory?(path, directory) && parent != "base"
+            raise ActionFailed, "VirtualBox disk #{id} is outside the linked clone directory or has no parent"
+          end
+
+          chain = linked_parent_chain(id, disks)
+          unless chain.drop(1).all? { |ancestor, _, _| existing.include?(ancestor) }
+            raise ActionFailed, "VirtualBox disk #{id} has an unexpected parent chain"
+          end
+
+          [chain, disk_file_identity(path)]
+        end
+        state[:virtualbox_linked_config] = info["CfgFile"]
+        state[:virtualbox_linked_logs] = info["LogFldr"]
+        checkpoint(state)
+      end
+
+      def linked_parent_chain(id, disks)
+        chain = []
+        until id == "base"
+          path, parent = disks[id]
+          if !path || chain.any? { |ancestor, _, _| ancestor == id }
+            raise ActionFailed, "VirtualBox could not verify linked disk #{id} and its parent chain"
+          end
+
+          chain << [id, path, parent]
+          id = parent
+        end
+        chain
+      end
+
+      def close_linked_clone_media(directory, state)
+        owned = state[:virtualbox_linked_media]
+        return unless owned
+
+        owned.each do |chain, identity|
+          id, path, = chain.first
+          disks = hard_disks
+          next if !disks.key?(id) && !File.exist?(path) && !File.symlink?(path)
+
+          verify_linked_disk(chain, identity, directory, disks)
+          if disks.key?(id)
+            vbox("closemedium", "disk", id, "--delete")
+          else
+            # Unregistering can also close a medium. Only unlink the same file we recorded.
+            File.unlink(path)
+          end
+        end
+        remove_linked_clone_artifacts(directory, state) if File.directory?(directory)
+      end
+
+      def verify_linked_disk(chain, identity, directory, disks)
+        id, path, parent = chain.first
+        other_disk_at_path = disks.any? { |other, (location, _)| other != id && location == path }
+        current_chain = disks.key?(id) ? linked_parent_chain(id, disks) : [chain.first, *linked_parent_chain(parent, disks)]
+        unless inside_directory?(path, directory) && !other_disk_at_path && current_chain == chain &&
+            canonical_disk_path(path) == path && disk_file_identity(path) == identity
+          raise ActionFailed, "VirtualBox linked disk #{id} or its parent chain changed"
+        end
+      end
+
+      def disk_file_identity(path)
+        stat = File.stat(path)
+        [stat.dev, stat.ino]
+      end
+
+      def remove_linked_clone_artifacts(directory, state)
+        files = [File.join(directory, "ssh_key")]
+        if (config_file = state[:virtualbox_linked_config])
+          files.concat([config_file, "#{config_file}-prev", "#{config_file}-tmp", config_file.sub(/\.vbox\z/, ".nvram")])
+        end
+        if (logs = state[:virtualbox_linked_logs]) && inside_directory?(canonical_disk_path(logs), directory)
+          files.concat(Dir.glob("VBox.log{,.[0-9]*}", base: logs).map { |name| File.join(logs, name) })
+        end
+
+        registered = hard_disks.values.flat_map { |path, _, location| [path, location] }
+        files.uniq.each do |file|
+          path = canonical_disk_path(file)
+          next unless inside_directory?(path, directory) && File.file?(file)
+          next if File.symlink?(file) || registered.include?(path) || registered.include?(file)
+
+          File.unlink(file)
+        end
+        Dir.glob("**/*/", base: directory).reverse_each do |relative|
+          path = File.join(directory, relative.delete_suffix("/"))
+          Dir.rmdir(path) if !File.symlink?(path) && Dir.empty?(path)
+        end
+        Dir.rmdir(directory) if Dir.empty?(directory)
+      end
+
+      def inside_directory?(path, directory)
+        path&.start_with?("#{directory}/")
+      end
+
+      def verify_clone_request(source, snapshot, state)
+        previous = state[:virtualbox_clone_request]
+        if state[:virtualbox_destroying] || (previous && previous != [source, snapshot])
+          raise ActionFailed, "Run kitchen destroy before recreating the VirtualBox instance with this configuration"
         end
       end
 
@@ -104,7 +236,14 @@ module Kitchen
           raise ActionFailed, "Invalid VirtualBox instance ID in Kitchen state"
         end
 
-        File.join(config[:kitchen_root], ".kitchen", "virtualbox-#{token}")
+        parent = File.join(File.realpath(config[:kitchen_root]), ".kitchen")
+        parent = File.realpath(parent) if File.directory?(parent)
+        directory = File.join(parent, "virtualbox-#{token}")
+        if File.symlink?(directory)
+          raise ActionFailed, "VirtualBox instance directory is a symlink: #{directory}"
+        end
+
+        directory
       end
 
       def registered_uuid(state)
@@ -133,7 +272,9 @@ module Kitchen
 
         clone_uuid = state.fetch(:virtualbox_token)
         state[:virtualbox_uuid] = clone_uuid
-        state[:virtualbox_linked_clone] = true if snapshot
+        state[:virtualbox_clone_request] ||= [source, snapshot]
+        state[:virtualbox_linked_clone] = !snapshot.nil?
+        state[:virtualbox_existing_disks] ||= hard_disks.keys if snapshot
         checkpoint(state)
         directory = vm_directory(state)
         FileUtils.mkdir_p(directory, mode: 0o700)
@@ -190,8 +331,8 @@ module Kitchen
             isolate_clone(uuid, info)
             info = vm_info(uuid)
           end
-          forwarding_rules(info).each do |rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete", rule.split(",").first)
+          forwarding_rules(info).each do |forwarding_rule|
+            vbox("modifyvm", uuid, "--nat-pf1", "delete", forwarding_rule.split(",").first)
           end
           TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
           vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}")

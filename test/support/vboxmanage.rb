@@ -15,14 +15,15 @@ when "list"
 
   registry.each { |id, vm| puts %("#{vm.fetch("name")}" {#{id}}) } if target == "vms"
   if target == "hdds"
-    JSON.parse(File.read(disks_path)).each do |id, path|
-      puts "UUID: #{id}", "Location: #{path}", ""
+    JSON.parse(File.read(disks_path)).each do |id, (path, parent)|
+      puts "UUID: #{id}", "Parent UUID: #{parent}", "Location: #{path}", ""
     end
   end
 when "showvminfo"
   vm = registry.fetch(uuid)
   puts %{UUID="#{uuid}"}
   puts %{VMState="#{vm.fetch("state")}"}
+  puts %{"SATA Controller-ImageUUID-0-0"="#{uuid}"} if vm["linked_snapshot"]
   puts 'nic1="nat"'
   puts %{nic2="#{vm.fetch("nic2", "none")}"}
   puts %{Forwarding(0)="#{vm["forwarding1"]},tcp,,8080,,80"} if vm["forwarding1"]
@@ -50,8 +51,9 @@ when "clonevm"
     directory = File.realpath(options.fetch(options.index("--basefolder") + 1))
     clone_disk = File.join(directory, "clone.vmdk")
     File.write(clone_disk, "")
-    source_disk = File.join(File.dirname(registry_path), "source.vmdk")
-    File.write(disks_path, JSON.generate(uuid => source_disk, clone_uuid => clone_disk))
+    disks = JSON.parse(File.read(disks_path))
+    disks[clone_uuid] = [clone_disk, uuid]
+    File.write(disks_path, JSON.generate(disks))
   else
     abort "expected a full clone" if options.include?("--options=Link")
   end
@@ -92,7 +94,18 @@ when "controlvm"
   registry.fetch(uuid)["state"] = "poweroff"
 when "unregistervm"
   abort "linked clone teardown must preserve shared media" if registry.fetch(uuid)["linked_snapshot"] && options.include?("--delete")
+  failure_marker = File.join(File.dirname(registry_path), "fail_unregister_once")
+  if File.exist?(File.join(File.dirname(registry_path), "close_on_unregister"))
+    disks = JSON.parse(File.read(disks_path))
+    disks.delete(uuid)
+    File.write(disks_path, JSON.generate(disks))
+  end
   registry.delete(uuid)
+  if File.exist?(failure_marker)
+    File.delete(failure_marker)
+    File.write(registry_path, JSON.generate(registry))
+    abort "simulated unregister failure"
+  end
 when "closemedium"
   abort "expected a disk" unless target == "disk"
 
@@ -103,8 +116,11 @@ when "closemedium"
   end
 
   disks = JSON.parse(File.read(disks_path))
-  abort "unknown disk" unless disks.delete(options.fetch(0))
+  path, parent = disks.fetch(options.fetch(0))
+  abort "expected to delete a linked disk" unless options.include?("--delete") && parent != "base"
 
+  File.delete(path)
+  disks.delete(options.fetch(0))
   File.write(disks_path, JSON.generate(disks))
 else
   abort "unexpected VBoxManage command #{ARGV.inspect}"
