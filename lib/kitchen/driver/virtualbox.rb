@@ -10,6 +10,7 @@ require "kitchen/box/source"
 require "kitchen/box/ssh_bootstrap"
 require "kitchen/state_file"
 require "mixlib/shellout" unless defined?(Mixlib::ShellOut)
+require "rexml/document" unless defined?(REXML::Document)
 require "securerandom" unless defined?(SecureRandom)
 require "socket" unless defined?(Socket)
 require "tempfile" unless defined?(Tempfile)
@@ -38,7 +39,27 @@ module Kitchen
       HARDWARE_LIMITS = { cpus: (1..64), memory: (4..2_097_152) }.freeze
       private_constant :HARDWARE_LIMITS
 
+      UUID_PATTERN = /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/
+      MANAGED_SHARE_NAME_PATTERN = /\Akitchen-[0-9a-f]{16}\z/
+      private_constant :MANAGED_SHARE_NAME_PATTERN
+
       include Box::Source
+
+      module RestoreTransportGuard
+        def connection(state, &block)
+          if state[:virtualbox_restore_pending]
+            raise ActionFailed, "Run kitchen create before connecting to the restored VirtualBox VM"
+          end
+
+          super
+        end
+      end
+
+      def finalize_config!(instance)
+        super
+        instance.transport.singleton_class.prepend(RestoreTransportGuard)
+        self
+      end
 
       def create(state)
         validate_hardware
@@ -46,20 +67,27 @@ module Kitchen
         private_network, private_address = private_network_settings
         folders = synced_folders
         prepare_state(state)
-        uuid = registered_uuid(state) || import_vm(state)
+        uuid = if state[:virtualbox_restore_pending]
+                 managed_vm_info(state).fetch("UUID")
+               else
+                 registered_uuid(state) || import_vm(state)
+               end
         state[:virtualbox_uuid] = uuid
-        checkpoint(state)
+        checkpoint(state) unless state[:virtualbox_restore_pending]
         ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
         configure_ssh(uuid, state)
-        connection = instance.transport.connection(state)
+        connection = instance.transport.connection(state.except(:virtualbox_restore_pending))
         connection.wait_until_ready
         configure_private_address(connection, uuid, private_address) if private_address
+        state.delete(:virtualbox_restore_pending)
       end
 
       def destroy(state)
         return unless state[:virtualbox_token]
 
-        if (uuid = registered_uuid(state))
+        uuid = registered_uuid(state)
+        managed_vm_info(state) if uuid && state[:virtualbox_restore_pending]
+        if uuid
           status = vm_info(uuid).fetch("VMState")
           case status
           when "running", "paused", "stuck"
@@ -72,6 +100,22 @@ module Kitchen
         directory = vm_directory(state)
         FileUtils.remove_entry_secure(directory) if File.exist?(directory)
         release_box_source(state)
+      end
+
+      def restore_snapshot(snapshot)
+        snapshot = snapshot.to_s.downcase
+        raise ActionFailed, "Provide a VirtualBox snapshot UUID" unless UUID_PATTERN.match?(snapshot)
+
+        state = state_file.read
+        info = managed_vm_info(state)
+        raise ActionFailed, "The managed VirtualBox VM must be powered off before restoring a snapshot" unless info["VMState"] == "poweroff"
+
+        verify_offline_snapshot(info.fetch("CfgFile"), snapshot)
+
+        %i{hostname port last_action}.each { |key| state.delete(key) }
+        state[:virtualbox_restore_pending] = true
+        checkpoint_restore(state)
+        vbox("snapshot", info.fetch("UUID"), "restore", snapshot)
       end
 
       def status(state)
@@ -105,6 +149,59 @@ module Kitchen
       end
 
       private
+
+      def managed_vm_info(state)
+        uuid = state[:virtualbox_uuid]
+        unless uuid.is_a?(String) && UUID_PATTERN.match?(uuid) && state[:virtualbox_token]
+          raise ActionFailed, "No Kitchen-managed VirtualBox VM recorded for #{instance.name}"
+        end
+
+        info = vm_info(uuid)
+        unless info["UUID"] == uuid && info["name"] == vm_name(state) && managed_config_path?(state, info["CfgFile"])
+          raise ActionFailed, "Could not verify the Kitchen-managed VirtualBox VM for #{instance.name}"
+        end
+
+        info
+      end
+
+      def verify_offline_snapshot(path, snapshot)
+        # VBoxManage snapshot showvminfo reports the current VM power state.
+        settings = REXML::Document.new(File.binread(path))
+        entry = settings.get_elements("//Snapshot").find { |node| node.attributes["uuid"]&.casecmp?("{#{snapshot}}") }
+        raise ActionFailed, "Snapshot does not exist on #{instance.name}: #{snapshot}" unless entry
+        raise ActionFailed, "Take the VirtualBox snapshot while the guest is powered off" if entry.attributes["stateFile"]
+
+        verify_snapshot_shared_folders(settings.elements["/VirtualBox/Machine"], entry)
+      rescue REXML::ParseException, SystemCallError
+        raise ActionFailed, "Could not read VirtualBox snapshot settings for #{instance.name}"
+      end
+
+      def verify_snapshot_shared_folders(machine, snapshot)
+        path = "Hardware/SharedFolders/SharedFolder"
+        snapshot.get_elements(path).each do |folder|
+          name = folder.attributes["name"]
+          next unless name&.match?(MANAGED_SHARE_NAME_PATTERN)
+
+          # The current ownership list cannot establish who owned an older mapping.
+          current = machine.get_elements(path).select { |mapping| mapping.attributes["name"] == name }
+          next if current.one? && current.first.attributes.to_h == folder.attributes.to_h
+
+          raise ActionFailed, "Snapshot would restore an ambiguous VirtualBox shared folder: #{name}"
+        end
+      end
+
+      def managed_config_path?(state, path)
+        return false unless path && File.file?(path)
+
+        directory = vm_directory(state)
+        File.realpath(directory) == directory && File.realpath(path).start_with?("#{directory}#{File::SEPARATOR}")
+      rescue SystemCallError
+        false
+      end
+
+      def vm_name(state)
+        "kitchen-#{instance.name}-#{state.fetch(:virtualbox_token)}"
+      end
 
       def synced_folders
         entries = config[:synced_folders]
@@ -250,21 +347,34 @@ module Kitchen
         return if state[:virtualbox_token]
 
         state[:virtualbox_token] = SecureRandom.uuid
-        state[:virtualbox_name] = "kitchen-#{instance.name}-#{state[:virtualbox_token]}"
+        state[:virtualbox_name] = vm_name(state)
         checkpoint(state)
       end
 
       def checkpoint(state)
-        StateFile.new(config[:kitchen_root], instance.name).write(state)
+        state[:virtualbox_restore_pending] ? checkpoint_restore(state) : state_file.write(state)
+      end
+
+      def state_file
+        StateFile.new(config[:kitchen_root], instance.name)
+      end
+
+      def checkpoint_restore(state)
+        path = state_file.path
+        Tempfile.create(".virtualbox-restore-", File.dirname(path)) do |file|
+          file.write(YAML.dump(Util.stringified_hash(state)))
+          file.fsync
+          File.rename(file.path, path)
+        end
       end
 
       def vm_directory(state)
         token = state.fetch(:virtualbox_token)
-        unless /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/.match?(token)
+        unless token.is_a?(String) && UUID_PATTERN.match?(token)
           raise ActionFailed, "Invalid VirtualBox instance ID in Kitchen state"
         end
 
-        File.join(config[:kitchen_root], ".kitchen", "virtualbox-#{token}")
+        File.join(File.realpath(File.dirname(state_file.path)), "virtualbox-#{token}")
       end
 
       def registered_uuid(state)
@@ -342,16 +452,23 @@ module Kitchen
       end
 
       def ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
-        host_port, guest_port = forward_ports
-        forward_rule = "kitchen-forward,tcp,127.0.0.1,#{host_port},,#{guest_port}" if host_port
+        host_port, forwarded_guest_port = forward_ports
+        forward_rule = "kitchen-forward,tcp,127.0.0.1,#{host_port},,#{forwarded_guest_port}" if host_port
         info = vm_info(uuid)
         actual_network = info["intnet2"] if info["nic2"] == "intnet"
         verify_private_settings(state, actual_network, private_network, private_address)
         extra_adapters = info.keys.grep(/\Anic[3-8]\z/).reject { |key| info[key] == "none" }
         forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
+        recovering = state[:virtualbox_restore_pending]
+        guest_port = instance.transport[:port] || 22
         if info.fetch("VMState") == "running"
           rule = forwarding.find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
           raise ActionFailed, "Running VirtualBox VM is missing its Kitchen SSH forwarding rule" unless rule
+
+          port = Integer(rule.split(",").fetch(3))
+          if recovering && (state[:port] != port || info["nic1"] != "nat" || rule != "kitchen-ssh,tcp,127.0.0.1,#{port},,#{guest_port}")
+            raise ActionFailed, "Shut down the restored VirtualBox VM before running kitchen create"
+          end
 
           actual_forward = forwarding.find { |value| value.start_with?("kitchen-forward,") }
           private_mismatch = private_network && (actual_network != private_network || !extra_adapters.empty?)
@@ -359,14 +476,18 @@ module Kitchen
             raise ActionFailed, "Running VirtualBox VM has different networking settings. Run kitchen destroy and then kitchen create."
           end
 
-          state[:port] = Integer(rule.split(",").fetch(3))
+          state[:port] = port
         else
+          if recovering && info["VMState"] != "poweroff"
+            raise ActionFailed, "Shut down the restored VirtualBox VM before running kitchen create"
+          end
+
           configure_shared_folders(uuid, state, folders, info)
           state[:port] = ssh_host_port(host_port)
           forwarding.each do |existing_rule|
             vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
           end
-          options = ["--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}"]
+          options = ["--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{guest_port}"]
           options.push("--nat-pf1", forward_rule) if forward_rule
           vbox("modifyvm", uuid, *options)
           if private_network
@@ -380,7 +501,10 @@ module Kitchen
 
         state[:hostname] = "127.0.0.1"
         record_private_settings(state, private_network, private_address)
-        vbox("startvm", uuid, "--type", "headless") unless info.fetch("VMState") == "running"
+        unless info.fetch("VMState") == "running"
+          checkpoint_restore(state) if recovering
+          vbox("startvm", uuid, "--type", "headless")
+        end
       end
 
       def record_private_settings(state, network, address)
