@@ -78,6 +78,10 @@ module Kitchen
         private_network, private_address = private_network_settings
         folders = synced_folders
         prepare_state(state)
+        if source.nil? && state[:virtualbox_uuid] == state[:virtualbox_token]
+          raise ActionFailed, "Run kitchen destroy before switching from a registered VirtualBox clone to a box."
+        end
+
         uuid = if state[:virtualbox_restore_pending]
                  managed_vm_info(state).fetch("UUID")
                else

@@ -94,6 +94,20 @@ class RegisteredSourceTest < Minitest::Test
     assert_equal shares, registry.fetch(uuid).fetch("managed_shares")
   end
 
+  def test_cannot_switch_a_registered_clone_to_an_imported_box
+    assert_kitchen "create"
+    current = registry
+    File.write(@configuration, File.read(@configuration).sub("source_vm: Disposable source", "box: replacement.box"))
+
+    [current, current.select { |id, _| id == SOURCE }].each do |registered|
+      File.write(@registry, JSON.generate(registered))
+      output, status = kitchen("create")
+      refute status.success?, output
+      assert_match(/Run kitchen destroy before switching/, output)
+      assert_equal registered, registry
+    end
+  end
+
   def test_missing_clone_requires_cleanup_before_recreating
     assert_kitchen "create"
     original_source = registry.fetch(SOURCE)
