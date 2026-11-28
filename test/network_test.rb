@@ -12,11 +12,11 @@ Dir.mktmpdir("kitchen-virtualbox-network") do |root|
   File.write(vbox, "#!#{RbConfig.ruby}\n" + <<~'RUBY')
     require "yaml"
 
-    command, _target, *options = ARGV
+    command, target, *options = ARGV
     vm = YAML.safe_load_file("vm.yml") if File.exist?("vm.yml")
     case command
     when "list"
-      puts %("#{vm.fetch("name")}" {9135d992-4a17-4748-99cd-b51c04080b28}) if vm
+      puts %("#{vm.fetch("name")}" {9135d992-4a17-4748-99cd-b51c04080b28}) if target == "vms" && vm
     when "import"
       name = options.fetch(options.index("--vmname") + 1)
       vm = { "name" => name, "VMState" => "poweroff", "nic1" => "nat",
@@ -58,6 +58,10 @@ Dir.mktmpdir("kitchen-virtualbox-network") do |root|
     when "startvm", "controlvm"
       vm["VMState"] = command == "startvm" ? "running" : "poweroff"
       File.write("vm.yml", YAML.dump(vm))
+    when "snapshot"
+      abort "Expected snapshot inventory query" unless options == %w{list --machinereadable}
+
+      puts "This machine does not have any snapshots"
     when "unregistervm"
       abort "Expected VM deletion" unless options == ["--delete"] && vm.fetch("VMState") == "poweroff"
 
