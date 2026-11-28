@@ -117,6 +117,7 @@ module Kitchen
 
         directory = vm_directory(state)
         uuid = registered_uuid(state)
+        verify_clone_destination(state, directory) unless uuid
         managed_vm_info(state) if uuid && state[:virtualbox_restore_pending]
         if uuid
           snapshots = vbox("snapshot", uuid, "list", "--machinereadable", returns: [0, 1]).strip
@@ -586,6 +587,13 @@ module Kitchen
         source_uuid
       end
 
+      def verify_clone_destination(state, directory)
+        return unless state[:virtualbox_uuid] == state[:virtualbox_token] && !state.key?(:virtualbox_media_identities)
+        return unless File.directory?(directory) && !Dir.empty?(directory)
+
+        raise ActionFailed, "VirtualBox left files before registering the clone. Inspect and clear #{directory} before retrying."
+      end
+
       def clone_vm(source, state)
         source_uuid = powered_off_source_uuid(source)
         clone_uuid = state.fetch(:virtualbox_token)
@@ -594,6 +602,7 @@ module Kitchen
           checkpoint(state)
         end
         directory = vm_directory(state)
+        verify_clone_destination(state, directory)
         FileUtils.mkdir_p(directory, mode: 0o700)
         vbox("clonevm", source_uuid, "--mode", "machine", "--name", state.fetch(:virtualbox_name),
           "--uuid", clone_uuid, "--basefolder", directory, "--register")
