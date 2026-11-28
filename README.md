@@ -32,8 +32,11 @@ Set `driver.disk_size_mib` to a positive integer to attach an unformatted,
 dynamically allocated VDI before boot. For example, `disk_size_mib: 512` adds
 a 512 MiB test disk in a free slot on the imported appliance. The option is
 omitted by default. Recreate an existing instance to add the disk or change its
-size. For newly created instances, Kitchen deletes its test disk on destroy and
-preserves unrelated attached disks.
+size. On destroy, Kitchen verifies disk ownership before deleting media and
+preserves unrelated attached disks. Destroy stops if the VM has snapshots,
+which may reference other disks. Review and remove the snapshots in VirtualBox
+before retrying. Kitchen preserves disks from older state files that lack
+recorded media identities.
 
 After adding a provisioner and suite, run `bundle exec kitchen test` from the
 Kitchen project. This driver requires Test Kitchen 4.2 or newer for the

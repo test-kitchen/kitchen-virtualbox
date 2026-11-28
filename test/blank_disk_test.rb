@@ -30,12 +30,14 @@ class BlankDiskTest < Minitest::Test
   def test_create_and_destroy_a_blank_disk_and_preserve_external_media
     configure(512)
     assert_kitchen "create"
+    boot_disk = registry.fetch("disks").fetch("Storage-0-0")
     disk = registry.fetch("disks").fetch("Storage-2-0")
     assert_equal "512", File.read(disk)
     assert_kitchen "create"
     assert_equal disk, registry.fetch("disks").fetch("Storage-2-0")
 
     assert_kitchen "destroy"
+    refute File.exist?(boot_disk)
     refute File.exist?(disk)
     refute File.exist?(@registry)
     assert_equal "unrelated disk", File.read(@external_disk)
@@ -73,9 +75,69 @@ class BlankDiskTest < Minitest::Test
     output, status = kitchen("create")
     refute status.success?, output
     assert_match(/simulated attach failure/, output)
+    disk = JSON.parse(File.read(File.join(@root, "media.json"))).values.find { |path| path.include?("test-disk-") }
+    assert File.file?(disk)
     assert_kitchen "destroy"
-    refute File.exist?(File.join(@root, "medium.json"))
+    refute File.exist?(disk)
     assert_equal "unrelated disk", File.read(@external_disk)
+  end
+
+  def test_destroy_preserves_replacement_file_at_an_owned_disk_path
+    configure(512)
+    assert_kitchen "create"
+    disk = registry.fetch("disks").fetch("Storage-2-0")
+    replacement = "#{disk}.replacement"
+    File.write(replacement, "replacement disk")
+    File.rename(replacement, disk)
+
+    assert_kitchen "destroy"
+    assert_equal "replacement disk", File.read(disk)
+  end
+
+  def test_destroy_refuses_to_delete_a_vm_with_snapshot_only_media
+    configure(512)
+    assert_kitchen "create"
+    vm = registry
+    vm["snapshot_disks"] = [vm.fetch("disks").delete("Storage-1-0")]
+    File.write(@registry, JSON.generate(vm))
+
+    output, status = kitchen("destroy")
+    refute status.success?, output
+    assert_match(/snapshot media ownership is unverified/, output)
+    assert_equal vm, registry
+    assert_equal "unrelated disk", File.read(@external_disk)
+  end
+
+  def test_destroy_preserves_replacement_medium_with_a_different_uuid
+    configure(512)
+    assert_kitchen "create"
+    disk = registry.fetch("disks").fetch("Storage-2-0")
+    registry_path = File.join(@root, "media.json")
+    media = JSON.parse(File.read(registry_path))
+    media.delete(media.key(disk))
+    media["22222222-2222-4222-8222-222222222222"] = disk
+    File.write(registry_path, JSON.generate(media))
+
+    assert_kitchen "destroy"
+    assert_equal "512", File.read(disk)
+  end
+
+  def test_create_after_vm_disappears_uses_a_new_blank_disk
+    configure(512)
+    assert_kitchen "create"
+    old_vm = registry
+    old_disk = old_vm.fetch("disks").fetch("Storage-2-0")
+    File.write(old_disk, "old guest data")
+    File.delete(@registry)
+
+    assert_kitchen "create"
+    new_vm = registry
+    new_disk = new_vm.fetch("disks").fetch("Storage-2-0")
+    refute_equal old_vm.fetch("uuid"), new_vm.fetch("uuid")
+    refute_equal old_disk, new_disk
+    assert_equal "512", File.read(new_disk)
+    assert_kitchen "destroy"
+    assert_equal "old guest data", File.read(old_disk)
   end
 
   def test_omitting_the_option_preserves_the_default_disk_layout
