@@ -10,6 +10,8 @@ uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 token = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 snapshot = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 online_snapshot = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+retired_share_snapshot = "11111111-1111-1111-1111-111111111111"
+changed_share_snapshot = "22222222-2222-2222-2222-222222222222"
 name = "kitchen-default-linux-#{token}"
 lib = File.expand_path("../lib", __dir__)
 cli = File.expand_path("../exe/kitchen-virtualbox-restore", __dir__)
@@ -23,9 +25,26 @@ Dir.mktmpdir("kitchen-virtualbox-restore-") do |root|
   File.write(vm_config, <<~XML)
     <VirtualBox xmlns="http://www.virtualbox.org/">
       <Machine>
+        <Hardware><SharedFolders>
+          <SharedFolder name="kitchen-0123456789abcdef" hostPath="/inherited" writable="false"/>
+        </SharedFolders></Hardware>
         <Snapshot uuid="{#{snapshot}}">
+          <Hardware><SharedFolders>
+            <SharedFolder name="kitchen-0123456789abcdef" hostPath="/inherited" writable="false"/>
+            <SharedFolder name="user-share" hostPath="/user"/>
+          </SharedFolders></Hardware>
           <Snapshots>
             <Snapshot uuid="{#{online_snapshot}}" stateFile="Snapshots/online.sav"/>
+            <Snapshot uuid="{#{retired_share_snapshot}}">
+              <Hardware><SharedFolders>
+                <SharedFolder name="kitchen-fedcba9876543210" hostPath="/retired" writable="true"/>
+              </SharedFolders></Hardware>
+            </Snapshot>
+            <Snapshot uuid="{#{changed_share_snapshot}}">
+              <Hardware><SharedFolders>
+                <SharedFolder name="kitchen-0123456789abcdef" hostPath="/inherited" writable="true"/>
+              </SharedFolders></Hardware>
+            </Snapshot>
           </Snapshots>
         </Snapshot>
       </Machine>
@@ -77,6 +96,8 @@ Dir.mktmpdir("kitchen-virtualbox-restore-") do |root|
 
   verify.call("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "Snapshot does not exist")
   verify.call(online_snapshot, "while the guest is powered off")
+  verify.call(retired_share_snapshot, "ambiguous VirtualBox shared folder: kitchen-fedcba9876543210")
+  verify.call(changed_share_snapshot, "ambiguous VirtualBox shared folder: kitchen-0123456789abcdef")
   verify.call(snapshot, "powered off", "VM_STATE" => "running")
   verify.call(snapshot, "Kitchen-managed VirtualBox VM", "VM_CONFIG" => state_file)
   File.symlink(state_file, File.join(vm_dir, "foreign.vbox"))

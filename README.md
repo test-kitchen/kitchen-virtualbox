@@ -148,6 +148,9 @@ instance name and VirtualBox snapshot UUID. The command checks which VM Kitchen
 owns and requires both the VM and the snapshot to be powered off. An unknown
 snapshot UUID leaves the VM and Kitchen state untouched. Restore rolls back
 guest disks and VM settings, including SSH forwarding, to the chosen snapshot.
+Restore refuses a snapshot that would reintroduce or change a shared folder
+using a Kitchen-generated name. Older snapshots can contain mappings that
+Kitchen no longer records as owned.
 
 The restore command leaves the VM off and invalidates Kitchen's saved SSH
 endpoint. Run `kitchen create INSTANCE` to refresh the forwarding rule and SSH

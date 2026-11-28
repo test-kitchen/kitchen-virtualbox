@@ -40,6 +40,8 @@ module Kitchen
       private_constant :HARDWARE_LIMITS
 
       UUID_PATTERN = /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/
+      MANAGED_SHARE_NAME_PATTERN = /\Akitchen-[0-9a-f]{16}\z/
+      private_constant :MANAGED_SHARE_NAME_PATTERN
 
       include Box::Source
 
@@ -168,8 +170,24 @@ module Kitchen
         entry = settings.get_elements("//Snapshot").find { |node| node.attributes["uuid"]&.casecmp?("{#{snapshot}}") }
         raise ActionFailed, "Snapshot does not exist on #{instance.name}: #{snapshot}" unless entry
         raise ActionFailed, "Take the VirtualBox snapshot while the guest is powered off" if entry.attributes["stateFile"]
+
+        verify_snapshot_shared_folders(settings.elements["/VirtualBox/Machine"], entry)
       rescue REXML::ParseException, SystemCallError
         raise ActionFailed, "Could not read VirtualBox snapshot settings for #{instance.name}"
+      end
+
+      def verify_snapshot_shared_folders(machine, snapshot)
+        path = "Hardware/SharedFolders/SharedFolder"
+        snapshot.get_elements(path).each do |folder|
+          name = folder.attributes["name"]
+          next unless name&.match?(MANAGED_SHARE_NAME_PATTERN)
+
+          # The current ownership list cannot establish who owned an older mapping.
+          current = machine.get_elements(path).select { |mapping| mapping.attributes["name"] == name }
+          next if current.one? && current.first.attributes.to_h == folder.attributes.to_h
+
+          raise ActionFailed, "Snapshot would restore an ambiguous VirtualBox shared folder: #{name}"
+        end
       end
 
       def managed_config_path?(state, path)
