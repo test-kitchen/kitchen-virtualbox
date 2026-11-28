@@ -84,6 +84,10 @@ module Kitchen
                  registered_uuid(state)
                end
         unless uuid
+          if source && state.key?(:virtualbox_media_identities)
+            raise ActionFailed, "The registered VirtualBox clone is missing. Run kitchen destroy before recreating it."
+          end
+
           reset_missing_vm(state) if state[:virtualbox_uuid] && !source
           uuid = source ? clone_vm(source, state) : import_vm(state)
         end
@@ -696,13 +700,14 @@ module Kitchen
             raise ActionFailed, "Shut down the restored VirtualBox VM before running kitchen create"
           end
 
-          configure_shared_folders(uuid, state, folders, info)
           state[:port] = ssh_host_port(host_port)
           # Registered-source clones use the Kitchen token as their VM UUID.
           if uuid == state[:virtualbox_token]
-            isolate_clone(uuid, info, keep_private_adapter: private_network && actual_network == private_network)
+            isolate_clone(uuid, info, Array(state[:virtualbox_managed_shares]),
+              keep_private_adapter: private_network && actual_network == private_network)
             info = vm_info(uuid)
           end
+          configure_shared_folders(uuid, state, folders, info)
           forwarding_rules(info).each do |existing_rule|
             vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
           end
@@ -783,7 +788,7 @@ module Kitchen
         info.select { |key, _| key.start_with?("Forwarding(") }.values
       end
 
-      def isolate_clone(uuid, info, keep_private_adapter:)
+      def isolate_clone(uuid, info, owned_shares, keep_private_adapter:)
         options = %w{--vrde off --clipboard-mode disabled --drag-and-drop disabled
           --usb-ohci off --usb-ehci off --usb-xhci off --nic-trace1 off --nic1 nat --cable-connected1 on}
         info.each do |key, value|
@@ -791,8 +796,8 @@ module Kitchen
             next if key == "nic2" && keep_private_adapter
 
             options.push("--#{key}", "none") if adapter[1].to_i > 1 && value != "none"
-          elsif key.start_with?("SharedFolderNameMachineMapping")
-            vbox("sharedfolder", "remove", uuid, "--name", value)
+          elsif key.start_with?("SharedFolderNameMachineMapping") && !owned_shares.include?(value)
+            vbox("sharedfolder", "remove", uuid, "--name=#{value}")
           end
         end
         vbox("modifyvm", uuid, *options, *hardware_options)

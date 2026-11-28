@@ -29,6 +29,7 @@ when "showvminfo"
     puts %{Forwarding(0)="#{vm["forwarding2"]},tcp,,8081,,80"}
   end
   puts %{SharedFolderNameMachineMapping1="#{vm.fetch("share")}"} if vm.key?("share")
+  Array(vm["managed_shares"]).each_with_index { |name, index| puts %{SharedFolderNameMachineMapping#{index + 2}="#{name}"} }
 when "clonevm"
   abort "attempted to clone a running source" unless registry.fetch(uuid).fetch("state") == "poweroff"
   abort "expected a full registered clone" unless options.include?("--register") && !options.include?("--options") &&
@@ -79,9 +80,23 @@ when "modifyvm"
     end
   end
 when "sharedfolder"
-  id, name_option, share = options
-  abort "unexpected shared folder operation" unless target == "remove" && name_option == "--name"
-  abort "unknown shared folder" unless registry.fetch(id).delete("share") == share
+  id, name = options
+  abort "missing shared folder name" unless name.start_with?("--name=")
+
+  share = name.delete_prefix("--name=")
+  vm = registry.fetch(id)
+  case target
+  when "add"
+    (vm["managed_shares"] ||= []) << share
+  when "remove"
+    if vm["share"] == share
+      vm.delete("share")
+    else
+      abort "unknown shared folder" unless vm.fetch("managed_shares", []).delete(share)
+    end
+  else
+    abort "unexpected shared folder operation"
+  end
 when "startvm"
   abort "clone network cable disconnected" if registry.fetch(uuid)["cable1"] == "off"
   registry.fetch(uuid)["state"] = "running"

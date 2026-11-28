@@ -12,6 +12,10 @@ module Kitchen
           raise ActionFailed, "Create the Kitchen instance before packaging it"
         end
 
+        if state[:virtualbox_uuid] == state[:virtualbox_token]
+          raise ActionFailed, "Packaging requires a VM imported from a box. Create an instance with driver.box."
+        end
+
         refuse_injected_key(state)
         output = File.join(config[:kitchen_root], "#{instance.name}.box")
         raise ActionFailed, "Package already exists: #{output}" if File.exist?(output) || File.symlink?(output)
