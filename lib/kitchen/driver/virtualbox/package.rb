@@ -50,7 +50,7 @@ module Kitchen
         if state[:virtualbox_generated_key] || state[:virtualbox_key_injected] || key_file_present?(state) ||
             File.symlink?(history) || !File.file?(history) || File.read(history, 37) != state[:virtualbox_uuid]
           raise ActionFailed, "Cannot safely remove the Kitchen-injected SSH key from a stopped VM. " \
-            "Create a fresh instance with driver.insert_key disabled and supply your own SSH credentials."
+            "Import a fresh instance with driver.box and driver.insert_key disabled, and supply your own SSH credentials."
         end
       end
 

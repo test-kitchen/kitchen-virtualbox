@@ -29,7 +29,7 @@ already has credentials, configure `transport.ssh_key` or
 The `vboxmanage` driver option can point to a binary outside `PATH`.
 
 Set `driver.cpus` to the number of virtual processors and `driver.memory` to
-guest RAM in MB when importing a new VM. Both settings accept positive
+guest RAM in MB when importing a VM or starting a registered-source clone. Both settings accept positive
 integers within VirtualBox 7.2's limits (1–64 CPUs and 4–2,097,152 MB).
 Omit either setting to retain the corresponding value from the image.
 Run `kitchen destroy` followed by
@@ -53,6 +53,29 @@ Set `TEST_KITCHEN_PATH` to use another compatible local checkout.
 Catalog-backed boxes are copied to the local Kitchen cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
+
+## Clone a registered VirtualBox VM
+
+```yaml
+driver:
+  name: virtualbox
+  source_vm: Ubuntu 24.04 template
+```
+
+Set `source_vm` to the exact name or UUID of a registered, powered-off VM
+instead of setting `box`. Keep the source powered off while Kitchen creates
+the full clone. Kitchen starts the clone and removes only the clone on
+`kitchen destroy`. If VirtualBox leaves files after a failed clone, run
+`kitchen destroy` before retrying.
+
+For templates without the Bento guest bootstrap setup, configure
+`transport.ssh_key` or `transport.password` for an existing SSH user.
+
+Use a trusted template with test data and credentials. The clone copies the
+guest disk, including any credentials stored in it. Kitchen removes inherited
+shared folders, disables extra network adapters, USB controllers, remote
+display, clipboard sharing and drag-and-drop, and configures loopback SSH
+forwarding. Review any other host integrations on the template before using it.
 
 ## Networking
 
@@ -85,7 +108,8 @@ driver:
   already configure its private adapter.
 
 SSH continues to use the first adapter and its loopback NAT forward.
-By default, secondary adapters retain their imported settings. With
+By default, imported VMs retain their secondary adapters and registered-source
+clones have secondary adapters disabled. With
 `private_network` configured, Kitchen replaces adapter 2's attachment and
 disables adapters 3–8 so inherited connections cannot bypass the private network.
 To change private networking for an existing VM or change forwarding while it

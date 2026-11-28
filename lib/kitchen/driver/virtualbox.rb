@@ -29,6 +29,7 @@ module Kitchen
       default_config :box_cache
       default_config :cpus
       default_config :memory
+      default_config :source_vm
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
       default_config :port_forward
@@ -66,6 +67,8 @@ module Kitchen
 
       def create(state)
         validate_hardware
+        source = config[:source_vm]
+        validate_source_vm(source)
         size = config[:disk_size_mib]
         unless size.nil? || (size.is_a?(Integer) && size > 0)
           raise ActionFailed, "VirtualBox driver.disk_size_mib must be a positive integer"
@@ -75,16 +78,24 @@ module Kitchen
         private_network, private_address = private_network_settings
         folders = synced_folders
         prepare_state(state)
+        if source.nil? && state[:virtualbox_uuid] == state[:virtualbox_token]
+          raise ActionFailed, "Run kitchen destroy before switching from a registered VirtualBox clone to a box."
+        end
+
         uuid = if state[:virtualbox_restore_pending]
                  managed_vm_info(state).fetch("UUID")
                else
                  registered_uuid(state)
                end
         unless uuid
-          reset_missing_vm(state) if state[:virtualbox_uuid]
-          uuid = import_vm(state)
+          if source && state.key?(:virtualbox_media_identities)
+            raise ActionFailed, "The registered VirtualBox clone is missing. Run kitchen destroy before recreating it."
+          end
+
+          reset_missing_vm(state) if state[:virtualbox_uuid] && !source
+          uuid = source ? clone_vm(source, state) : import_vm(state)
         end
-        unless state[:virtualbox_uuid]
+        unless state.key?(:virtualbox_media_identities) || state[:virtualbox_restore_pending]
           directory = File.realpath(vm_directory(state))
           paths = storage_slots(vm_info(uuid)).values
           state[:virtualbox_media_identities] = registered_disks.filter_map do |id, path|
@@ -110,6 +121,7 @@ module Kitchen
 
         directory = vm_directory(state)
         uuid = registered_uuid(state)
+        verify_clone_destination(state, directory) unless uuid
         managed_vm_info(state) if uuid && state[:virtualbox_restore_pending]
         if uuid
           snapshots = vbox("snapshot", uuid, "list", "--machinereadable", returns: [0, 1]).strip
@@ -170,7 +182,7 @@ module Kitchen
       end
 
       def doctor(_state)
-        checks = [-> { vbox("list", "vms") }, method(:validate_box)]
+        checks = [-> { vbox("list", "vms") }, method(:validate_vm_source)]
         problems = checks.filter_map do |check|
           check.call
           nil
@@ -482,6 +494,18 @@ module Kitchen
           message: message, checked_at: Time.now.utc.iso8601 }
       end
 
+      def validate_vm_source
+        source = config[:source_vm]
+        validate_source_vm(source)
+        source.nil? ? validate_box : powered_off_source_uuid(source)
+      end
+
+      def validate_source_vm(source)
+        unless source.nil? || (source.is_a?(String) && !source.strip.empty? && config[:box].nil?)
+          raise ActionFailed, "Set driver.source_vm to a registered VirtualBox VM name or UUID without driver.box"
+        end
+      end
+
       def validate_box
         box = config[:box]
         if box.is_a?(Hash)
@@ -510,6 +534,7 @@ module Kitchen
 
         state[:virtualbox_token] = SecureRandom.uuid
         state[:virtualbox_name] = vm_name(state)
+        state[:virtualbox_uuid] = state[:virtualbox_token] if config[:source_vm]
         checkpoint(state)
       end
 
@@ -540,14 +565,52 @@ module Kitchen
       end
 
       def registered_uuid(state)
-        vbox("list", "vms").each_line do |line|
-          entry = /\A"(.*)" \{([0-9a-f-]+)\}\s*\z/i.match(line)
-          next unless entry
+        registered_vms.find do |name, uuid|
+          state[:virtualbox_uuid] ? uuid == state[:virtualbox_uuid] : name == state[:virtualbox_name]
+        end&.last
+      end
 
-          name, uuid = entry.captures
-          return uuid if state[:virtualbox_uuid] ? uuid == state[:virtualbox_uuid] : name == state[:virtualbox_name]
+      def registered_vms
+        vbox("list", "vms").each_line.filter_map do |line|
+          entry = /\A"(.*)" \{([0-9a-f-]+)\}\s*\z/i.match(line)
+          entry&.captures
         end
-        nil
+      end
+
+      def powered_off_source_uuid(source)
+        vms = registered_vms
+        source_vm = vms.find { |_, uuid| uuid.casecmp?(source) } || vms.find { |name, _| name == source }
+        raise ActionFailed, "VirtualBox source VM is not registered: #{source}" unless source_vm
+
+        source_uuid = source_vm.last
+        status = vm_info(source_uuid).fetch("VMState")
+        unless status == "poweroff"
+          raise ActionFailed, "VirtualBox source VM #{source.inspect} must be powered off (current state: #{status})"
+        end
+
+        source_uuid
+      end
+
+      def verify_clone_destination(state, directory)
+        return unless state[:virtualbox_uuid] == state[:virtualbox_token] && !state.key?(:virtualbox_media_identities)
+        return unless File.directory?(directory) && !Dir.empty?(directory)
+
+        raise ActionFailed, "VirtualBox left files before registering the clone. Inspect and clear #{directory} before retrying."
+      end
+
+      def clone_vm(source, state)
+        source_uuid = powered_off_source_uuid(source)
+        clone_uuid = state.fetch(:virtualbox_token)
+        if state[:virtualbox_uuid] != clone_uuid
+          state[:virtualbox_uuid] = clone_uuid
+          checkpoint(state)
+        end
+        directory = vm_directory(state)
+        verify_clone_destination(state, directory)
+        FileUtils.mkdir_p(directory, mode: 0o700)
+        vbox("clonevm", source_uuid, "--mode", "machine", "--name", state.fetch(:virtualbox_name),
+          "--uuid", clone_uuid, "--basefolder", directory, "--register")
+        registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
       end
 
       def import_vm(state)
@@ -565,16 +628,19 @@ module Kitchen
             raise ActionFailed, "VirtualBox box is missing a regular box.ovf: #{source}"
           end
 
-          hardware = HARDWARE_LIMITS.keys.flat_map do |setting|
-            config[setting] ? ["--#{setting}", config[setting].to_s] : []
-          end
-          vbox("import", appliance, "--options", "importtovdi", "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory, *hardware)
+          vbox("import", appliance, "--options", "importtovdi", "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory, *hardware_options)
         end
         uuid = registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
         File.write(key_history_path(state), uuid, mode: "wx", perm: 0o600)
         uuid
       rescue Box::LocalArchive::InvalidBox => e
         raise ActionFailed, e.message
+      end
+
+      def hardware_options
+        HARDWARE_LIMITS.keys.flat_map do |setting|
+          config[setting] ? ["--#{setting}", config[setting].to_s] : []
+        end
       end
 
       def configured_forward_ports
@@ -623,10 +689,10 @@ module Kitchen
         actual_network = info["intnet2"] if info["nic2"] == "intnet"
         verify_private_settings(state, actual_network, private_network, private_address)
         extra_adapters = info.keys.grep(/\Anic[3-8]\z/).reject { |key| info[key] == "none" }
-        forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
         recovering = state[:virtualbox_restore_pending]
         guest_port = instance.transport[:port] || 22
         if info.fetch("VMState") == "running"
+          forwarding = forwarding_rules(info)
           rule = forwarding.find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
           raise ActionFailed, "Running VirtualBox VM is missing its Kitchen SSH forwarding rule" unless rule
 
@@ -647,9 +713,15 @@ module Kitchen
             raise ActionFailed, "Shut down the restored VirtualBox VM before running kitchen create"
           end
 
-          configure_shared_folders(uuid, state, folders, info)
           state[:port] = ssh_host_port(host_port)
-          forwarding.each do |existing_rule|
+          # Registered-source clones use the Kitchen token as their VM UUID.
+          if uuid == state[:virtualbox_token]
+            isolate_clone(uuid, info, Array(state[:virtualbox_managed_shares]),
+              keep_private_adapter: private_network && actual_network == private_network)
+            info = vm_info(uuid)
+          end
+          configure_shared_folders(uuid, state, folders, info)
+          forwarding_rules(info).each do |existing_rule|
             vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
           end
           options = ["--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{guest_port}"]
@@ -723,6 +795,25 @@ module Kitchen
           echo "VirtualBox private adapter #{formatted_mac} is missing in the guest" >&2
           exit 1
         SH
+      end
+
+      def forwarding_rules(info)
+        info.select { |key, _| key.start_with?("Forwarding(") }.values
+      end
+
+      def isolate_clone(uuid, info, owned_shares, keep_private_adapter:)
+        options = %w{--vrde off --clipboard-mode disabled --drag-and-drop disabled
+          --usb-ohci off --usb-ehci off --usb-xhci off --nic-trace1 off --nic1 nat --cable-connected1 on}
+        info.each do |key, value|
+          if (adapter = /\Anic([0-9]+)\z/.match(key))
+            next if key == "nic2" && keep_private_adapter
+
+            options.push("--#{key}", "none") if adapter[1].to_i > 1 && value != "none"
+          elsif key.start_with?("SharedFolderNameMachineMapping") && !owned_shares.include?(value)
+            vbox("sharedfolder", "remove", uuid, "--name=#{value}")
+          end
+        end
+        vbox("modifyvm", uuid, *options, *hardware_options)
       end
 
       def configure_ssh(uuid, state)
