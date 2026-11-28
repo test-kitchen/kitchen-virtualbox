@@ -37,6 +37,19 @@ Catalog-backed boxes are copied to the local Kitchen cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
 
+## Packaging an instance
+
+Create a fresh instance with `driver.insert_key: false` and supply your own
+SSH credentials. Shut down the guest completely, then run
+`kitchen package INSTANCE` to create `INSTANCE.box` in the Kitchen root.
+The source VM stays registered and an existing output file is preserved.
+Set `driver.box` to the new archive to create another instance.
+
+Packaging refuses instances with evidence of a Kitchen-injected SSH key.
+The archive includes guest disk contents, including any credentials or data
+that you placed in the guest. Packaging requires standalone VM-owned disks
+and a VM without connected optical media or shared folders.
+
 ## Apache smoke tests
 
 Mount the NAS or set `KITCHEN_BOX_MANIFEST` to a manifest containing the

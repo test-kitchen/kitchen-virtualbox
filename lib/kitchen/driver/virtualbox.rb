@@ -12,6 +12,7 @@ require "securerandom" unless defined?(SecureRandom)
 require "socket" unless defined?(Socket)
 require "tempfile" unless defined?(Tempfile)
 require "tmpdir" unless defined?(Dir.mktmpdir)
+require_relative "virtualbox/package"
 
 module Kitchen
   module Driver
@@ -26,6 +27,7 @@ module Kitchen
       default_config :insert_key, true
 
       include Box::Source
+      include VirtualboxPackage
 
       def create(state)
         prepare_state(state)
@@ -122,7 +124,7 @@ module Kitchen
           state[:port] = Integer(rule.split(",").fetch(3))
         else
           forwarding.each do |rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{rule.split(",").first}")
+            vbox("modifyvm", uuid, "--nat-pf1", "delete", rule.split(",").first)
           end
           TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
           vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}")
@@ -141,6 +143,9 @@ module Kitchen
 
         user = transport[:username]
         user = "vagrant" if user.nil? || user == "root"
+        # Guest control can change authorized_keys even if it reports failure.
+        state[:virtualbox_key_injected] = true
+        checkpoint(state)
         state[:ssh_key] = Box::SshBootstrap.install(vm_directory(state), runner: method(:command)) do |arguments|
           install_guest_key(uuid, user, arguments)
         end
