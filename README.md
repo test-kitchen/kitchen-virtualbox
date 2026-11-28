@@ -35,6 +35,16 @@ Omit either setting to retain the corresponding value from the image.
 Run `kitchen destroy` followed by
 `kitchen create` to change the hardware of an existing Kitchen VM.
 
+Set `driver.disk_size_mib` to a positive integer to attach an unformatted,
+dynamically allocated VDI before boot. For example, `disk_size_mib: 512` adds
+a 512 MiB test disk in a free slot on the imported appliance. The option is
+omitted by default. Recreate an existing instance to add the disk or change its
+size. On destroy, Kitchen verifies disk ownership before deleting media and
+preserves unrelated attached disks. Destroy stops if the VM has snapshots,
+which may reference other disks. Review and remove the snapshots in VirtualBox
+before retrying. Kitchen preserves disks from older state files that lack
+recorded media identities.
+
 After adding a provisioner and suite, run `bundle exec kitchen test` from the
 Kitchen project. This driver requires Test Kitchen 4.2 or newer for the
 shared box catalog and cache API.
@@ -117,6 +127,102 @@ To change private networking for an existing VM or change forwarding while it
 is running, run `kitchen destroy` followed by `kitchen create`. Bridged
 networking, host-only adapters, IPv6 configuration and UDP forwarding are
 unsupported.
+
+## Packaging an instance
+
+Create a fresh instance with `driver.insert_key: false` and supply your own
+SSH credentials. Shut down the guest completely, then run
+`kitchen package INSTANCE` to create `INSTANCE.box` in the Kitchen root.
+The source VM stays registered and an existing output file is preserved.
+Set `driver.box` to the new archive to create another instance.
+
+Packaging requires a fresh import with a recorded history of no Kitchen SSH
+key injection. Instances created by older driver versions must be recreated.
+The archive includes guest disk contents, including any credentials or data
+that you placed in the guest or inherited from the input box. The driver
+imports new VM disks as VDI. Packaging requires standalone VDI disks attached
+only to the source VM and a VM without connected optical media or shared
+folders.
+
+Packaging also requires portable virtual hardware. Remove host-connected serial
+ports, host or external TPM settings, and custom firmware logos before export.
+
+## Shared folders
+
+Use `driver.synced_folders` to mount host directories in a Linux
+guest. Each entry gives the host directory and the absolute guest mount path.
+Relative host paths resolve from the Kitchen project directory. Shares are
+writable by default. Set `readonly: true` on any share that should allow only reads.
+Set `create: true` to create a missing host directory and `disabled: true` to
+skip a share. Use `%{instance_name}` in a host path for per-instance directories.
+Use a dedicated directory for writable shares to keep Kitchen's state outside
+the guest's write access.
+
+```yaml
+driver:
+  name: virtualbox
+  synced_folders:
+    - ["./fixtures", "/mnt/fixtures", { readonly: true }]
+    - ["./results", "/mnt/results"]
+```
+
+Install VirtualBox Guest Additions with automount support in the guest. Use
+root or the permissions provided by the guest's `vboxsf` group to access
+the mounts. Run `kitchen destroy` and `kitchen create` to apply share changes
+to an existing instance. Destroy removes the VM and preserves the shared
+host directories and their contents.
+
+## Restore a snapshot
+
+Create the instance with `kitchen create` and use its `virtualbox_uuid` from
+`.kitchen/INSTANCE.yml` as `VM_UUID` below. Write a marker in the guest, then
+shut the guest down cleanly before taking the snapshot.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'echo baseline > ~/snapshot-marker'
+```
+
+```sh
+VBoxManage snapshot VM_UUID take baseline
+VBoxManage snapshot VM_UUID list --machinereadable
+VBoxManage startvm VM_UUID --type headless
+```
+
+Once SSH is ready, change the marker and shut the guest down cleanly again.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'echo changed > ~/snapshot-marker'
+```
+
+Use the listed snapshot UUID as `SNAPSHOT_UUID` to restore the guest disk.
+
+```sh
+bundle exec kitchen-virtualbox-restore INSTANCE SNAPSHOT_UUID
+bundle exec kitchen create INSTANCE
+```
+
+Once SSH is ready, verify that the guest contains the original marker.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'grep -qx baseline ~/snapshot-marker'
+```
+
+Run the restore command from the Kitchen project and supply the exact Kitchen
+instance name and VirtualBox snapshot UUID. The command checks which VM Kitchen
+owns and requires both the VM and the snapshot to be powered off. An unknown
+snapshot UUID leaves the VM and Kitchen state untouched. Restore rolls back
+guest disks and VM settings, including SSH forwarding, to the chosen snapshot.
+Restore refuses a snapshot that would reintroduce or change a shared folder
+using a Kitchen-generated name. Older snapshots can contain mappings that
+Kitchen no longer records as owned.
+
+The restore command leaves the VM off and invalidates Kitchen's saved SSH
+endpoint. Run `kitchen create INSTANCE` to refresh the forwarding rule and SSH
+credentials and reapply the configured shared folders before using
+`kitchen exec` or `kitchen login`. If restore is interrupted, retry it while the
+guest is powered off, or run `kitchen create` to reconnect to the guest in its
+current state. Avoid concurrent lifecycle commands for the same instance. `kitchen destroy` requires the VM to have no snapshots. Remove them in
+VirtualBox before destroying the instance.
 
 ## Status and diagnostics
 

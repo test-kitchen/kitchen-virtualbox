@@ -1,0 +1,20 @@
+#!/usr/bin/env ruby
+# Copyright 2026 Dan Webb
+# SPDX-License-Identifier: Apache-2.0
+
+require "kitchen/cli"
+require "kitchen/driver/virtualbox"
+
+abort "Usage: kitchen-virtualbox-restore INSTANCE SNAPSHOT_UUID" unless ARGV.size == 2
+
+name, snapshot = ARGV
+begin
+  instance = Kitchen::CLI.new.config.instances.find { |candidate| candidate.name == name }
+  abort "Unknown Kitchen instance: #{name}" unless instance
+  abort "Kitchen instance does not use the VirtualBox driver: #{name}" unless instance.driver.is_a?(Kitchen::Driver::Virtualbox)
+
+  instance.driver.restore_snapshot(snapshot)
+  puts "Restored snapshot #{snapshot} on #{name}"
+rescue Kitchen::Error, Kitchen::StateFileLoadError => e
+  abort e.message
+end

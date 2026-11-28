@@ -1,7 +1,7 @@
 require "rake/testtask"
 
 Rake::TestTask.new(:test) do |task|
-  task.pattern = "spec/**/*_spec.rb"
+  task.test_files = FileList["spec/**/*_spec.rb", "test/**/*_test.rb", "test/snapshot_restore.rb"].exclude("test/network_test.rb")
 end
 
 task :test do
