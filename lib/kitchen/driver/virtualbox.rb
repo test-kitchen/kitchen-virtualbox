@@ -16,6 +16,7 @@ require "socket" unless defined?(Socket)
 require "tempfile" unless defined?(Tempfile)
 require "time" unless defined?(Time.zone_offset)
 require "tmpdir" unless defined?(Dir.mktmpdir)
+require_relative "virtualbox/package"
 
 module Kitchen
   module Driver
@@ -36,6 +37,7 @@ module Kitchen
       default_config :private_network
       default_config :private_address
       default_config :synced_folders, []
+      default_config :disk_size_mib
 
       # VBoxManage's guest limits on the 64-bit hosts supported by VirtualBox 7.2.
       HARDWARE_LIMITS = { cpus: (1..64), memory: (4..2_097_152) }.freeze
@@ -46,6 +48,7 @@ module Kitchen
       private_constant :MANAGED_SHARE_NAME_PATTERN
 
       include Box::Source
+      include VirtualboxPackage
 
       module RestoreTransportGuard
         def connection(state, &block)
@@ -72,6 +75,11 @@ module Kitchen
         end
 
         validate_source_vm(source)
+        size = config[:disk_size_mib]
+        unless size.nil? || (size.is_a?(Integer) && size > 0)
+          raise ActionFailed, "VirtualBox driver.disk_size_mib must be a positive integer"
+        end
+
         forward_ports = configured_forward_ports
         private_network, private_address = private_network_settings
         folders = synced_folders
@@ -80,11 +88,26 @@ module Kitchen
         uuid = if state[:virtualbox_restore_pending]
                  managed_vm_info(state).fetch("UUID")
                else
-                 registered_uuid(state) || (source ? clone_vm(source, snapshot, state) : import_vm(state))
+                 registered_uuid(state)
                end
+        unless uuid
+          reset_missing_vm(state) if state[:virtualbox_uuid] && !source
+          uuid = source ? clone_vm(source, snapshot, state) : import_vm(state)
+        end
+        unless state.key?(:virtualbox_media_identities) || state[:virtualbox_restore_pending]
+          directory = File.realpath(vm_directory(state))
+          paths = storage_slots(vm_info(uuid)).values
+          state[:virtualbox_media_identities] = registered_disks.filter_map do |id, path|
+            next unless paths.include?(path) && path.start_with?("#{directory}/")
+
+            identity = disk_identity(path)
+            [id.to_sym, identity] if identity
+          end.to_h
+        end
         record_linked_clone_media(uuid, state) if state[:virtualbox_linked_clone]
         state[:virtualbox_uuid] = uuid
         checkpoint(state) unless state[:virtualbox_restore_pending]
+        attach_blank_disk(uuid, state, size) if size && !state[:virtualbox_restore_pending]
         ensure_running(uuid, state, forward_ports, private_network, private_address, folders)
         configure_ssh(uuid, state)
         connection = instance.transport.connection(state.except(:virtualbox_restore_pending))
@@ -100,6 +123,11 @@ module Kitchen
         uuid = registered_uuid(state)
         managed_vm_info(state) if uuid && state[:virtualbox_restore_pending]
         if uuid
+          snapshots = vbox("snapshot", uuid, "list", "--machinereadable", returns: [0, 1]).strip
+          unless snapshots == "This machine does not have any snapshots"
+            raise ActionFailed, "Cannot destroy the VirtualBox VM while snapshot media ownership is unverified"
+          end
+
           if state[:virtualbox_linked_clone]
             record_linked_clone_media(uuid, state)
             disks = hard_disks
@@ -109,22 +137,27 @@ module Kitchen
             state[:virtualbox_destroying] = true
             checkpoint(state)
           end
-          status = vm_info(uuid).fetch("VMState")
+          info = vm_info(uuid)
+          status = info.fetch("VMState")
           case status
           when "running", "paused", "stuck"
             vbox("controlvm", uuid, "poweroff")
           when "saved"
             vbox("discardstate", uuid)
           end
-          # Linked clones share a disk chain with their source. Delete only files we own.
-          options = state[:virtualbox_linked_clone] ? [] : ["--delete"]
-          vbox("unregistervm", uuid, *options)
+          # Linked clones share a disk chain with their source.
+          if state[:virtualbox_linked_clone]
+            vbox("unregistervm", uuid)
+          else
+            detach_unowned_media(uuid, info, state)
+            vbox("unregistervm", uuid, "--delete")
+          end
         end
-        if state[:virtualbox_linked_clone]
-          close_linked_clone_media(directory, state)
-        elsif File.directory?(directory)
-          FileUtils.remove_entry_secure(directory)
-        end
+        clean_owned_media(state)
+        close_linked_clone_media(directory, state) if state[:virtualbox_linked_clone]
+        FileUtils.rm_f(File.join(directory, "ssh_key"))
+        invalidate_key_history(state)
+        Dir.rmdir(directory) if File.directory?(directory) && Dir.empty?(directory)
         release_box_source(state)
       end
 
@@ -175,6 +208,135 @@ module Kitchen
       end
 
       private
+
+      def attach_blank_disk(uuid, state, size)
+        unless state[:virtualbox_media_identities]
+          raise ActionFailed, "Recreate the VirtualBox instance before enabling driver.disk_size_mib"
+        end
+
+        info = vm_info(uuid)
+        id = state[:virtualbox_blank_disk_uuid]
+        if state[:virtualbox_disk_size_mib] && state[:virtualbox_disk_size_mib] != size
+          raise ActionFailed, "Destroy the VirtualBox instance before changing driver.disk_size_mib"
+        end
+
+        if id
+          path = verified_owned_disks(state)[id]
+          raise ActionFailed, "Cannot verify the VirtualBox blank disk identity" unless path
+
+          return if storage_slots(info).value?(path)
+        end
+
+        unless info.fetch("VMState") == "poweroff"
+          raise ActionFailed, "Power off the VirtualBox instance before attaching a blank test disk"
+        end
+
+        controller, port, device = ensure_free_disk_slot(uuid, info)
+        unless id
+          path = File.join(File.realpath(vm_directory(state)), "test-disk-#{SecureRandom.uuid}.vdi")
+          vbox("createmedium", "disk", "--filename", path, "--size", size.to_s, "--format", "VDI")
+          id = registered_disks.key(path)
+          identity = disk_identity(path)
+          raise ActionFailed, "VirtualBox did not report the new blank disk identity" unless id && identity
+
+          state[:virtualbox_media_identities][id.to_sym] = identity
+          state[:virtualbox_blank_disk_uuid] = id
+          state[:virtualbox_disk_size_mib] = size
+          checkpoint(state)
+        end
+        vbox("storageattach", uuid, "--storagectl", controller, "--port", port, "--device", device,
+          "--type", "hdd", "--medium", id)
+      end
+
+      def ensure_free_disk_slot(uuid, info)
+        slots = storage_slots(info)
+        expandable = nil
+        info.each_key do |key|
+          next unless (match = /\Astoragecontrollername(\d+)\z/.match(key))
+
+          index = match[1]
+          type = info["storagecontrollertype#{index}"]
+          next if %w{I82078 USB}.include?(type)
+
+          name = info.fetch(key)
+          devices = %w{PIIX3 PIIX4 ICH6}.include?(type) ? %w{0 1} : ["0"]
+          port_count = Integer(info.fetch("storagecontrollerportcount#{index}"))
+          max_ports = Integer(info.fetch("storagecontrollermaxportcount#{index}", port_count))
+          expandable ||= [name, port_count] if port_count < max_ports
+          port_count.times do |port|
+            devices.each do |device|
+              medium = slots[[name, port.to_s, device]]
+              return [name, port.to_s, device] if medium.nil? || medium == "none"
+            end
+          end
+        end
+        if expandable
+          name, port = expandable
+          vbox("storagectl", uuid, "--name", name, "--portcount", (port + 1).to_s)
+          return [name, port.to_s, "0"]
+        end
+
+        raise ActionFailed, "VirtualBox VM has no free disk slot for driver.disk_size_mib"
+      end
+
+      def storage_slots(info)
+        controllers = info.filter_map { |key, value| value if /\Astoragecontrollername\d+\z/.match?(key) }
+        info.each_with_object({}) do |(key, value), slots|
+          match = /\A"(.+)-(\d+)-(\d+)"\z/.match(key)
+          slots[match.captures] = value if match && controllers.include?(match[1])
+        end
+      end
+
+      def detach_unowned_media(uuid, info, state)
+        owned_disks = verified_owned_disks(state)
+        storage_slots(info).each do |(controller, port, device), medium|
+          next if %w{none emptydrive}.include?(medium)
+
+          id = info[%Q{"#{controller}-ImageUUID-#{port}-#{device}"}]
+          next if owned_disks[id] == medium
+
+          vbox("storageattach", uuid, "--storagectl", controller, "--port", port, "--device", device, "--medium", "none")
+        end
+      end
+
+      def clean_owned_media(state)
+        verified_owned_disks(state).each_key do |id|
+          vbox("closemedium", "disk", id, "--delete")
+        end
+      end
+
+      def registered_disks
+        vbox("list", "hdds").split(/\n\s*\n/).filter_map do |entry|
+          id = entry[/^UUID:[ \t]+([0-9a-f-]+)$/, 1]
+          path = entry[/^Location:[ \t]+(.+)$/, 1]
+          [id, path] if id && path && entry.match?(/^Parent UUID:[ \t]+base$/)
+        end.to_h
+      end
+
+      def verified_owned_disks(state)
+        identities = state[:virtualbox_media_identities] || {}
+        return {} if identities.empty?
+
+        registered_disks.select do |id, path|
+          identity = identities[id.to_sym]
+          identity && identity == disk_identity(path)
+        end
+      end
+
+      def disk_identity(path)
+        return unless File.realpath(path) == path
+
+        stat = File.stat(path)
+        [path, stat.dev, stat.ino] if stat.file?
+      rescue Errno::ENOENT, Errno::ENOTDIR
+        nil
+      end
+
+      def reset_missing_vm(state)
+        %i{virtualbox_token virtualbox_uuid virtualbox_owned_media virtualbox_media_identities
+           virtualbox_blank_disk virtualbox_blank_disk_uuid virtualbox_disk_size_mib}.each { |key| state.delete(key) }
+        prepare_state(state)
+      end
 
       def managed_vm_info(state)
         uuid = state[:virtualbox_uuid]
@@ -612,6 +774,7 @@ module Kitchen
         checkpoint(state) if state.delete(:virtualbox_uuid)
         directory = vm_directory(state)
         FileUtils.mkdir_p(directory, mode: 0o700)
+        invalidate_key_history(state)
         Dir.mktmpdir("box-", directory) do |staging|
           Box::LocalArchive.new(source, provider: "virtualbox").extract(staging) { |*args| command(*args) }
           appliance = File.join(staging, "box.ovf")
@@ -619,9 +782,11 @@ module Kitchen
             raise ActionFailed, "VirtualBox box is missing a regular box.ovf: #{source}"
           end
 
-          vbox("import", appliance, "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory, *hardware_options)
+          vbox("import", appliance, "--options", "importtovdi", "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory, *hardware_options)
         end
-        registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
+        uuid = registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
+        File.write(key_history_path(state), uuid, mode: "wx", perm: 0o600)
+        uuid
       rescue Box::LocalArchive::InvalidBox => e
         raise ActionFailed, e.message
       end
@@ -818,12 +983,26 @@ module Kitchen
 
         user = transport[:username]
         user = "vagrant" if user.nil? || user == "root"
+        # Guest control can change authorized_keys even if it reports failure.
+        invalidate_key_history(state)
+        state[:virtualbox_key_injected] = true
+        checkpoint(state)
         state[:ssh_key] = Box::SshBootstrap.install(vm_directory(state), runner: method(:command)) do |arguments|
           install_guest_key(uuid, user, arguments)
         end
         state[:username] = user
         state[:virtualbox_generated_key] = true
         state[:virtualbox_generated_key_user] = true
+      end
+
+      def key_history_path(state)
+        File.join(vm_directory(state), "no-kitchen-key")
+      end
+
+      def invalidate_key_history(state)
+        File.delete(key_history_path(state))
+      rescue Errno::ENOENT
+        nil
       end
 
       def install_guest_key(uuid, user, arguments)
@@ -851,13 +1030,13 @@ module Kitchen
         end
       end
 
-      def vbox(*arguments)
-        command(config[:vboxmanage], *arguments)
+      def vbox(*arguments, **options)
+        command(config[:vboxmanage], *arguments, **options)
       end
 
-      def command(*arguments)
+      def command(*arguments, **options)
         debug("Running #{arguments.first(3).inspect}")
-        process = Mixlib::ShellOut.new(*arguments, timeout: 600)
+        process = Mixlib::ShellOut.new(*arguments, timeout: 600, **options)
         process.run_command
         process.error!
         process.stdout
