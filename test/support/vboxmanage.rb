@@ -49,6 +49,12 @@ when "clonevm"
   clone_uuid = options.fetch(options.index("--uuid") + 1)
   abort "clone already registered" if registry.key?(clone_uuid)
 
+  if File.exist?(File.join(File.dirname(registry_path), "fail_before_registration"))
+    directory = options.fetch(options.index("--basefolder") + 1)
+    File.write(File.join(directory, "unverified.vdi"), "unverified media")
+    abort "simulated pre-registration failure"
+  end
+
   name = options.fetch(options.index("--name") + 1)
   registry[clone_uuid] = registry.fetch(uuid).merge("name" => name, "source" => uuid)
   if (snapshot = registry.fetch(uuid)["snapshot"])

@@ -237,6 +237,23 @@ class RegisteredSourceTest < Minitest::Test
     assert_equal before, registry
   end
 
+  def test_partial_clone_files_are_preserved_and_reported
+    File.write(File.join(@root, "fail_before_registration"), "")
+    output, status = kitchen("create")
+    refute status.success?, output
+    assert_match(/simulated pre-registration failure/, output)
+
+    %w{create destroy}.each do |action|
+      output, status = kitchen(action)
+      refute status.success?, output
+      assert_match(/left files before registering the clone/, output)
+    end
+    paths = Dir.glob(File.join(@root, ".kitchen", "virtualbox-*", "unverified.vdi"))
+    assert_equal 1, paths.length
+    assert_equal "unverified media", File.read(paths.first)
+    assert_equal [SOURCE], registry.keys
+  end
+
   def test_retry_recovers_a_clone_registered_before_the_command_failed
     File.write(@configuration, File.read(@configuration).sub("source_vm: Disposable source", "source_vm: #{SOURCE}"))
     File.write(File.join(@root, "fail_clone_once"), "")
