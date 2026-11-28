@@ -26,7 +26,7 @@ module Kitchen
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
 
-      UUID_PATTERN = /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/.freeze
+      UUID_PATTERN = /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/
 
       include Box::Source
 
