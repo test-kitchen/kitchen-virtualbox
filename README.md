@@ -93,6 +93,25 @@ is running, run `kitchen destroy` followed by `kitchen create`. Bridged
 networking, host-only adapters, IPv6 configuration and UDP forwarding are
 unsupported.
 
+## Packaging an instance
+
+Create a fresh instance with `driver.insert_key: false` and supply your own
+SSH credentials. Shut down the guest completely, then run
+`kitchen package INSTANCE` to create `INSTANCE.box` in the Kitchen root.
+The source VM stays registered and an existing output file is preserved.
+Set `driver.box` to the new archive to create another instance.
+
+Packaging requires a fresh import with a recorded history of no Kitchen SSH
+key injection. Instances created by older driver versions must be recreated.
+The archive includes guest disk contents, including any credentials or data
+that you placed in the guest or inherited from the input box. The driver
+imports new VM disks as VDI. Packaging requires standalone VDI disks attached
+only to the source VM and a VM without connected optical media or shared
+folders.
+
+Packaging also requires portable virtual hardware. Remove host-connected serial
+ports, host or external TPM settings, and custom firmware logos before export.
+
 ## Shared folders
 
 Use `driver.synced_folders` to mount host directories in a Linux

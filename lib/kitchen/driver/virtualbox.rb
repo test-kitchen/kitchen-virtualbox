@@ -16,6 +16,7 @@ require "socket" unless defined?(Socket)
 require "tempfile" unless defined?(Tempfile)
 require "time" unless defined?(Time.zone_offset)
 require "tmpdir" unless defined?(Dir.mktmpdir)
+require_relative "virtualbox/package"
 
 module Kitchen
   module Driver
@@ -45,6 +46,7 @@ module Kitchen
       private_constant :MANAGED_SHARE_NAME_PATTERN
 
       include Box::Source
+      include VirtualboxPackage
 
       module RestoreTransportGuard
         def connection(state, &block)
@@ -554,6 +556,7 @@ module Kitchen
         checkpoint(state) if state.delete(:virtualbox_uuid)
         directory = vm_directory(state)
         FileUtils.mkdir_p(directory, mode: 0o700)
+        invalidate_key_history(state)
         Dir.mktmpdir("box-", directory) do |staging|
           Box::LocalArchive.new(source, provider: "virtualbox").extract(staging) { |*args| command(*args) }
           appliance = File.join(staging, "box.ovf")
@@ -564,9 +567,11 @@ module Kitchen
           hardware = HARDWARE_LIMITS.keys.flat_map do |setting|
             config[setting] ? ["--#{setting}", config[setting].to_s] : []
           end
-          vbox("import", appliance, "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory, *hardware)
+          vbox("import", appliance, "--options", "importtovdi", "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory, *hardware)
         end
-        registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
+        uuid = registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
+        File.write(key_history_path(state), uuid, mode: "wx", perm: 0o600)
+        uuid
       rescue Box::LocalArchive::InvalidBox => e
         raise ActionFailed, e.message
       end
@@ -729,12 +734,26 @@ module Kitchen
 
         user = transport[:username]
         user = "vagrant" if user.nil? || user == "root"
+        # Guest control can change authorized_keys even if it reports failure.
+        invalidate_key_history(state)
+        state[:virtualbox_key_injected] = true
+        checkpoint(state)
         state[:ssh_key] = Box::SshBootstrap.install(vm_directory(state), runner: method(:command)) do |arguments|
           install_guest_key(uuid, user, arguments)
         end
         state[:username] = user
         state[:virtualbox_generated_key] = true
         state[:virtualbox_generated_key_user] = true
+      end
+
+      def key_history_path(state)
+        File.join(vm_directory(state), "no-kitchen-key")
+      end
+
+      def invalidate_key_history(state)
+        File.delete(key_history_path(state))
+      rescue Errno::ENOENT
+        nil
       end
 
       def install_guest_key(uuid, user, arguments)
