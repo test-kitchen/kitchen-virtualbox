@@ -32,7 +32,7 @@ Dir.mktmpdir("kitchen-virtualbox-lifecycle") do |root|
       puts %Q{Forwarding(0)="\#{File.read("forwarding")}"} if File.file?("forwarding")
     when "modifyvm"
       rule = ARGV.fetch(ARGV.index("--nat-pf1") + 1)
-      if rule == "delete=image-rule"
+      if rule == "delete" && ARGV.last == "image-rule"
         File.write("removed-image-rule", "")
       else
         abort "Unexpected forwarding rule: \#{rule}" unless /\\A#{rule_name},tcp,127\\.0\\.0\\.1,\\d+,,#{listener_port}\\z/.match?(rule)

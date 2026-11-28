@@ -5,7 +5,8 @@ Rake::TestTask.new(:test) do |task|
 end
 
 task :test do
-  ruby "-Ilib", "-e", 'require "kitchen/driver/virtualbox"'
+  ruby "-Ilib", "-e", %q{require "kitchen/driver/virtualbox"}
+  ruby "test/network_test.rb"
   ruby "test/winrm_test.rb", "negotiate", "http", "5985"
   ruby "test/winrm_test.rb", "ssl", "https", "5986"
   ruby "test/winrm_test.rb", "negotiate", "http", "15985", "15985"

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 require "fileutils" unless defined?(FileUtils)
+require "ipaddr" unless defined?(IPAddr)
 require "kitchen"
 require "kitchen/box/local_archive"
 require "kitchen/box/source"
@@ -27,6 +28,9 @@ module Kitchen
       default_config :memory
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
+      default_config :port_forward
+      default_config :private_network
+      default_config :private_address
 
       # VBoxManage's guest limits on the 64-bit hosts supported by VirtualBox 7.2.
       HARDWARE_LIMITS = { cpus: (1..64), memory: (4..2_097_152) }.freeze
@@ -36,13 +40,21 @@ module Kitchen
 
       def create(state)
         validate_hardware
+        forward_ports = configured_forward_ports
+        private_network, private_address = private_network_settings
+        if winrm? && private_network
+          raise ActionFailed, "VirtualBox private networking requires the SSH transport"
+        end
+
         prepare_state(state)
         uuid = registered_uuid(state) || import_vm(state)
         state[:virtualbox_uuid] = uuid
         checkpoint(state)
-        ensure_running(uuid, state)
+        ensure_running(uuid, state, forward_ports, private_network, private_address)
         configure_ssh(uuid, state) unless winrm?
-        instance.transport.connection(state).wait_until_ready
+        connection = instance.transport.connection(state)
+        connection.wait_until_ready
+        configure_private_address(connection, uuid, private_address) if private_address
       end
 
       def destroy(state)
@@ -194,7 +206,48 @@ module Kitchen
         raise ActionFailed, e.message
       end
 
-      def ensure_running(uuid, state)
+      def configured_forward_ports
+        forward = config[:port_forward]
+        return if forward.nil?
+
+        ports = forward.values_at(:host_port, :guest_port) if forward.is_a?(Hash)
+        unless ports && ports.all? { |port| port.is_a?(Integer) && (1..65535).cover?(port) }
+          raise ActionFailed, "VirtualBox driver.port_forward requires integer host_port and guest_port in 1..65535"
+        end
+
+        ports
+      end
+
+      def private_network_settings
+        network = config[:private_network]
+        address = config[:private_address]
+        unless network.nil? || (network.is_a?(String) && /\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/.match?(network))
+          raise ActionFailed, "VirtualBox driver.private_network requires an internal network name using letters, digits, dots, underscores or hyphens"
+        end
+        return [network, nil] if address.nil?
+
+        unless network && address.is_a?(String) && %r{\A[\d.]+/(?:[1-9]|[12][0-9]|3[0-2])\z}.match?(address) && IPAddr.new(address).ipv4?
+          raise ActionFailed, "VirtualBox driver.private_address requires an IPv4 CIDR address and driver.private_network"
+        end
+
+        [network, address]
+      rescue IPAddr::InvalidAddressError
+        raise ActionFailed, "VirtualBox driver.private_address requires a valid IPv4 CIDR address"
+      end
+
+      def verify_private_settings(state, actual_network, network, address)
+        applied = state.values_at(:virtualbox_private_network, :virtualbox_private_address)
+        pending = state[:virtualbox_pending_private_settings]
+        # A command may fail before changing the NIC or after VirtualBox has applied it.
+        recorded = [applied, pending].compact.find { |settings| actual_network && settings.first == actual_network }
+        return if recorded.nil? || recorded == [network, address]
+
+        raise ActionFailed, "VirtualBox VM has different private networking settings. Run kitchen destroy and then kitchen create."
+      end
+
+      def ensure_running(uuid, state, forward_ports, private_network, private_address)
+        host_port, forward_guest_port = forward_ports
+        forward_rule = "kitchen-forward,tcp,127.0.0.1,#{host_port},,#{forward_guest_port}" if host_port
         info = vm_info(uuid)
         winrm = winrm?
         if winrm && info.any? { |key, value| /\Anic(?:[2-9]|[1-9]\d+)\z/.match?(key) && value != "none" }
@@ -204,6 +257,9 @@ module Kitchen
         rule_name = winrm ? "kitchen-winrm" : "kitchen-ssh"
         guest_port = instance.transport[:port] || 22
         rule_prefix = "#{rule_name},tcp,127.0.0.1,"
+        actual_network = info["intnet2"] if info["nic2"] == "intnet"
+        verify_private_settings(state, actual_network, private_network, private_address)
+        extra_adapters = info.keys.grep(/\Anic[3-8]\z/).reject { |key| info[key] == "none" }
         forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
         if info.fetch("VMState") == "running"
           rule = forwarding.find { |value| value.start_with?(rule_prefix) }
@@ -211,16 +267,86 @@ module Kitchen
             raise ActionFailed, "Running VirtualBox VM is missing its #{rule_name} forwarding rule for the configured transport. Run kitchen destroy before changing the transport or its guest port."
           end
 
+          actual_forward = forwarding.find { |value| value.start_with?("kitchen-forward,") }
+          private_mismatch = private_network && (actual_network != private_network || !extra_adapters.empty?)
+          if actual_forward != forward_rule || private_mismatch
+            raise ActionFailed, "Running VirtualBox VM has different networking settings. Run kitchen destroy and then kitchen create."
+          end
+
           state[:port] = Integer(rule.split(",").fetch(3))
         else
-          forwarding.each do |imported_rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{imported_rule.split(",").first}")
+          state[:port] = ssh_host_port(host_port)
+          forwarding.each do |existing_rule|
+            vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
           end
-          TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
-          vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "#{rule_prefix}#{state[:port]},,#{guest_port}")
-          vbox("startvm", uuid, "--type", "headless")
+          options = ["--nic1", "nat", "--nat-pf1", "#{rule_prefix}#{state[:port]},,#{guest_port}"]
+          options.push("--nat-pf1", forward_rule) if forward_rule
+          vbox("modifyvm", uuid, *options)
+          if private_network
+            state[:virtualbox_pending_private_settings] = [private_network, private_address]
+            checkpoint(state)
+            adapters = ["--intnet2", private_network, "--nic2", "intnet", "--cable-connected2", "on"]
+            extra_adapters.each { |key| adapters.push("--#{key}", "none") }
+            vbox("modifyvm", uuid, *adapters)
+          end
         end
+
         state[:hostname] = "127.0.0.1"
+        record_private_settings(state, private_network, private_address)
+        vbox("startvm", uuid, "--type", "headless") unless info.fetch("VMState") == "running"
+      end
+
+      def record_private_settings(state, network, address)
+        pending = state.delete(:virtualbox_pending_private_settings)
+        return if !pending && state.values_at(:virtualbox_private_network, :virtualbox_private_address) == [network, address]
+
+        if network
+          state[:virtualbox_private_network] = network
+          state[:virtualbox_private_address] = address
+        else
+          state.delete(:virtualbox_private_network)
+          state.delete(:virtualbox_private_address)
+        end
+        checkpoint(state)
+      end
+
+      def ssh_host_port(forwarded_port)
+        TCPServer.open("127.0.0.1", 0) do |socket|
+          port = socket.addr[1]
+          return port unless forwarded_port
+
+          if port == forwarded_port
+            return TCPServer.open("127.0.0.1", 0) { |other| other.addr[1] }
+          end
+
+          TCPServer.open("127.0.0.1", forwarded_port, &:close)
+          port
+        end
+      rescue Errno::EADDRINUSE, Errno::EACCES => e
+        raise ActionFailed, "Could not bind VirtualBox port forward on 127.0.0.1:#{forwarded_port}: #{e.message}"
+      end
+
+      def configure_private_address(connection, uuid, address)
+        mac = vm_info(uuid)["macaddress2"]
+        unless mac && /\A\h{12}\z/.match?(mac)
+          raise ActionFailed, "VirtualBox did not report a MAC address for the private adapter"
+        end
+
+        formatted_mac = mac.downcase.scan(/../).join(":")
+        connection.execute(<<~SH)
+          set -eu
+          for device in /sys/class/net/*; do
+            [ "$(cat "$device/address")" = "#{formatted_mac}" ] || continue
+            iface=${device##*/}
+            elevate=
+            [ "$(id -u)" -eq 0 ] || elevate="sudo -n"
+            $elevate ip link set dev "$iface" up
+            $elevate ip -4 address replace #{address} dev "$iface"
+            exit 0
+          done
+          echo "VirtualBox private adapter #{formatted_mac} is missing in the guest" >&2
+          exit 1
+        SH
       end
 
       def winrm?
