@@ -46,6 +46,24 @@ For example, use Windows Server 2022 x86-64 on a supported x86-64 host, or
 Windows 11 Arm64 on an Apple silicon Mac. See Oracle's
 [host and guest combinations](https://docs.oracle.com/en/virtualization/virtualbox/7.2/user/Introduction.html).
 
+To prepare a private smoke box on an Apple silicon Mac, install Windows 11 Pro
+from the [Microsoft Arm64 ISO](https://www.microsoft.com/en-us/software-download/windows11arm64)
+in a Windows 11 Arm VM with one NAT adapter. Use a dedicated local
+administrator with a unique password. From elevated Windows PowerShell,
+enable the WinRM listener with `Enable-PSRemoting -Force -SkipNetworkProfileCheck`.
+Keep the source on NAT without port forwards. Use the example's default
+`negotiate` transport and leave WinRM Basic authentication and unencrypted
+messages disabled. Detach the ISO and shut Windows down before exporting.
+
+Export into a new private directory and archive the OVF and its accompanying
+files. Keep the resulting box local because its disk contains the test account.
+
+```sh
+VBoxManage export W11-ARM-SMOKE --output box.ovf
+printf '%s\n' '{"provider":"virtualbox"}' > metadata.json
+tar -czf windows-arm64.box -- metadata.json box.ovf *.vmdk
+```
+
 Set `transport.name: winrm` and supply the image's credentials through
 Kitchen configuration. The driver uses NAT on the first adapter and replaces
 its imported port forwards with a WinRM forward bound to `127.0.0.1`. Kitchen
@@ -60,6 +78,8 @@ environment variables and run it from the driver checkout.
 - `KITCHEN_WINRM_USERNAME` and `KITCHEN_WINRM_PASSWORD` are the image credentials.
 - `KITCHEN_WINRM_TRANSPORT` optionally selects `ssl`. Use a certificate trusted
   by Ruby on the host and valid for the loopback IP address `127.0.0.1`.
+  Keep `transport.no_ssl_peer_verification: false` explicit in your Kitchen
+  configuration to verify the server certificate.
 - `KITCHEN_WINRM_PORT` optionally supplies a non-default guest listener port.
 - `VBOXMANAGE` optionally selects the VirtualBox executable.
 
@@ -69,12 +89,24 @@ cd examples/windows
 bundle exec kitchen test --destroy always
 ```
 
-To check recovery, first run `bundle exec kitchen create` with an incorrect
-test credential. Restore the correct credential and rerun `kitchen create`
-to reconnect to the same VM. Then run `kitchen converge`, `kitchen verify`
-and `kitchen destroy` through Bundler. You can also run `kitchen destroy`
-immediately after a failed create to remove the VM. If the listener port or
-transport itself changes, destroy the VM before recreating it.
+To check recovery, export a disposable copy of the smoke box with the WinRM
+service disabled (`Set-Service WinRM -StartupType Disabled` in elevated
+PowerShell). Run `bundle exec kitchen create` with the normal credentials and
+wait for readiness to fail. Open the imported clone in the VirtualBox console
+and run the following in elevated PowerShell.
+
+```powershell
+Set-Service WinRM -StartupType Manual
+Start-Service WinRM
+winrm enumerate winrm/config/listener
+```
+
+Check that the expected listener is present, then rerun
+`bundle exec kitchen create` to reconnect to the same VM. Run
+`bundle exec kitchen converge`, `bundle exec kitchen verify` and
+`bundle exec kitchen destroy`. To test cleanup after a listener outage, run
+`bundle exec kitchen destroy` immediately after the failed create. Destroy
+the VM before changing the configured transport or guest listener port.
 
 ## Apache smoke tests
 
