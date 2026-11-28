@@ -1,0 +1,32 @@
+---
+name: Remote box integration
+
+"on":
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  remote-box:
+    runs-on: ubuntu-latest
+    env:
+      TEST_KITCHEN_PATH: ${{ github.workspace }}/kitchen-core
+    steps:
+      - uses: actions/checkout@v7
+      # Keep the driver tests in this repository. Use the core PR for its runtime.
+      - uses: actions/checkout@v7
+        with:
+          repository: test-kitchen/test-kitchen
+          ref: f03b3c14d198f7ea89e7d6d3c008959657c15937
+          path: kitchen-core
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      - name: Require remote catalog support
+        run: >-
+          bundle exec ruby -r kitchen/box/catalog
+          -e 'abort unless Kitchen::Box::Catalog.method_defined?(:copy_archive)'
+      - run: bundle exec rake test
