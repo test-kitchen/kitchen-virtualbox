@@ -75,6 +75,41 @@ class RegisteredSourceTest < Minitest::Test
     assert_equal({ SOURCE => source }, registry)
   end
 
+  def test_clone_reapplies_its_shared_folder_after_poweroff
+    config = File.read(@configuration).sub("source_vm: Disposable source", <<~YAML.chomp)
+      source_vm: Disposable source
+        synced_folders:
+          - [., /mnt/kitchen, {readonly: true}]
+    YAML
+    File.write(@configuration, config)
+
+    assert_kitchen "create"
+    current = registry
+    uuid, clone = current.find { |id, _| id != SOURCE }
+    shares = clone.fetch("managed_shares").dup
+    assert_equal 1, shares.length
+    clone["state"] = "poweroff"
+    File.write(@registry, JSON.generate(current))
+
+    assert_kitchen "create"
+    assert_equal shares, registry.fetch(uuid).fetch("managed_shares")
+  end
+
+  def test_missing_clone_requires_cleanup_before_recreating
+    assert_kitchen "create"
+    original_source = registry.fetch(SOURCE)
+    File.write(@registry, JSON.generate(SOURCE => original_source))
+
+    output, status = kitchen("create")
+    refute status.success?, output
+    assert_match(/registered VirtualBox clone is missing.*Run kitchen destroy/, output)
+    assert_equal({ SOURCE => original_source }, registry)
+
+    assert_kitchen "destroy"
+    assert_kitchen "create"
+    assert_equal 2, registry.size
+  end
+
   def test_running_source_is_rejected_before_cloning
     source_state("running")
     output, status = kitchen("create")
