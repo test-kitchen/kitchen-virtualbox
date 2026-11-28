@@ -100,6 +100,7 @@ module Kitchen
         checkpoint(state) if state.delete(:virtualbox_uuid)
         directory = vm_directory(state)
         FileUtils.mkdir_p(directory, mode: 0o700)
+        invalidate_key_history(state)
         Dir.mktmpdir("box-", directory) do |staging|
           Box::LocalArchive.new(source, provider: "virtualbox").extract(staging) { |*args| command(*args) }
           appliance = File.join(staging, "box.ovf")
@@ -107,9 +108,12 @@ module Kitchen
             raise ActionFailed, "VirtualBox box is missing a regular box.ovf: #{source}"
           end
 
-          vbox("import", appliance, "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory)
+          vbox("import", appliance, "--options", "importtovdi",
+            "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory)
         end
-        registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
+        uuid = registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
+        File.write(key_history_path(state), uuid, mode: "wx", perm: 0o600)
+        uuid
       rescue Box::LocalArchive::InvalidBox => e
         raise ActionFailed, e.message
       end
@@ -123,8 +127,8 @@ module Kitchen
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
-          forwarding.each do |rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete", rule.split(",").first)
+          forwarding.each do |existing_rule|
+            vbox("modifyvm", uuid, "--nat-pf1", "delete", existing_rule.split(",").first)
           end
           TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
           vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}")
@@ -144,6 +148,7 @@ module Kitchen
         user = transport[:username]
         user = "vagrant" if user.nil? || user == "root"
         # Guest control can change authorized_keys even if it reports failure.
+        invalidate_key_history(state)
         state[:virtualbox_key_injected] = true
         checkpoint(state)
         state[:ssh_key] = Box::SshBootstrap.install(vm_directory(state), runner: method(:command)) do |arguments|
@@ -152,6 +157,16 @@ module Kitchen
         state[:username] = user
         state[:virtualbox_generated_key] = true
         state[:virtualbox_generated_key_user] = true
+      end
+
+      def key_history_path(state)
+        File.join(vm_directory(state), "no-kitchen-key")
+      end
+
+      def invalidate_key_history(state)
+        File.delete(key_history_path(state))
+      rescue Errno::ENOENT
+        nil
       end
 
       def install_guest_key(uuid, user, arguments)

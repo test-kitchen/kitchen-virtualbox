@@ -45,10 +45,13 @@ SSH credentials. Shut down the guest completely, then run
 The source VM stays registered and an existing output file is preserved.
 Set `driver.box` to the new archive to create another instance.
 
-Packaging refuses instances with evidence of a Kitchen-injected SSH key.
+Packaging requires a fresh import with a recorded history of no Kitchen SSH
+key injection. Instances created by older driver versions must be recreated.
 The archive includes guest disk contents, including any credentials or data
-that you placed in the guest. Packaging requires standalone VM-owned disks
-and a VM without connected optical media or shared folders.
+that you placed in the guest or inherited from the input box. The driver
+imports new VM disks as VDI. Packaging requires standalone VDI disks attached
+only to the source VM and a VM without connected optical media or shared
+folders.
 
 ## Apache smoke tests
 

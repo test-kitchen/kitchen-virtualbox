@@ -46,7 +46,9 @@ module Kitchen
       private
 
       def refuse_injected_key(state)
-        if state[:virtualbox_generated_key] || state[:virtualbox_key_injected] || key_file_present?(state)
+        history = key_history_path(state)
+        if state[:virtualbox_generated_key] || state[:virtualbox_key_injected] || key_file_present?(state) ||
+            File.symlink?(history) || !File.file?(history) || File.read(history, 37) != state[:virtualbox_uuid]
           raise ActionFailed, "Cannot safely remove the Kitchen-injected SSH key from a stopped VM. " \
             "Create a fresh instance with driver.insert_key disabled and supply your own SSH credentials."
         end
@@ -74,7 +76,7 @@ module Kitchen
         end
 
         refuse_injected_key(current)
-        stopped_package_vm(uuid, current)
+        package_components(uuid, current)
       end
 
       def package_components(uuid, state)
@@ -87,12 +89,11 @@ module Kitchen
         end
         nvram = details["NvramFile"]
         media = disks + [details["CfgFile"], nvram].compact.reject(&:empty?)
-        if disks.empty? || media.any? { |path| !File.file?(path) || !File.realpath(path).start_with?("#{directory}/") } ||
-            disks.any? { |path| !%w{.vmdk .vdi .vhd .hdd}.include?(File.extname(path).downcase) }
+        if disks.empty? || media.any? { |path| !File.file?(path) || !File.realpath(path).start_with?("#{directory}/") }
           raise ActionFailed, "Package requires VM-owned disks and no mounted optical media"
         end
-        unless disks.all? { |path| vbox("showmediuminfo", "disk", path).match?(/^Parent UUID:\s+base$/) }
-          raise ActionFailed, "Package requires standalone VirtualBox disks without snapshot or clone parents"
+        unless disks.uniq == disks && disks.all? { |path| standalone_package_disk?(path, uuid) }
+          raise ActionFailed, "Package requires standalone VDI disks attached only to the source VM"
         end
         if details.keys.any? { |key| key.start_with?("SharedFolderName") }
           raise ActionFailed, "Remove VirtualBox shared folders before packaging the VM"
@@ -101,6 +102,17 @@ module Kitchen
         components = { ".vmdk" => disks.length }
         components[".nvram"] = 1 unless nvram.to_s.empty?
         components
+      end
+
+      def standalone_package_disk?(path, uuid)
+        return false unless File.extname(path).downcase == ".vdi" && !File.symlink?(path) && File.stat(path).nlink == 1
+
+        medium = vbox("showmediuminfo", "disk", path)
+        medium.match?(/^Storage format:[ \t]+vdi$/i) &&
+          medium.match?(/^Parent UUID:[ \t]+base$/) &&
+          medium.match?(/^Type:[ \t]+normal(?: \(base\))?$/) &&
+          !medium.match?(/^Child UUIDs?:/) &&
+          medium.scan(/\(UUID: ([0-9a-f-]+)\)/i).flatten == [uuid]
       end
 
       def validate_appliance(appliance, components)
