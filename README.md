@@ -37,6 +37,53 @@ Catalog-backed boxes are copied to the local Kitchen cache. Use
 `kitchen box prune --dry-run` to see unused archives and their size. Run
 `kitchen destroy` to release a VM's cache lease.
 
+## Restore a snapshot
+
+Create the instance with `kitchen create` and use its `virtualbox_uuid` from
+`.kitchen/INSTANCE.yml` as `VM_UUID` below. Write a marker in the guest, then
+shut the guest down cleanly before taking the snapshot.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'echo baseline > ~/snapshot-marker'
+```
+
+```sh
+VBoxManage snapshot VM_UUID take baseline
+VBoxManage snapshot VM_UUID list --machinereadable
+VBoxManage startvm VM_UUID --type headless
+```
+
+Once SSH is ready, change the marker and shut the guest down cleanly again.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'echo changed > ~/snapshot-marker'
+```
+
+Use the listed snapshot UUID as `SNAPSHOT_UUID` to restore the guest disk.
+
+```sh
+bundle exec kitchen-virtualbox-restore INSTANCE SNAPSHOT_UUID
+VBoxManage startvm VM_UUID --type headless
+```
+
+Once SSH is ready, verify that the guest contains the original marker.
+
+```sh
+bundle exec kitchen exec INSTANCE -c 'grep -qx baseline ~/snapshot-marker'
+```
+
+Run the restore command from the Kitchen project and supply the exact Kitchen
+instance name and VirtualBox snapshot UUID. The command checks which VM Kitchen
+owns and requires it to be powered off. An unknown snapshot UUID leaves the VM
+unchanged. Restore rolls back guest disks and VM settings, including SSH
+forwarding, to the chosen snapshot. Kitchen's local state stays as it was, so
+use a snapshot from the same instance with its current SSH settings.
+
+The workflow supports snapshots taken with the guest powered off. It never
+starts the VM automatically. Shut down the guest before restoring again and
+avoid concurrent lifecycle commands for the same instance. Snapshots belong to
+the managed VM and are removed by `kitchen destroy`.
+
 ## Apache smoke tests
 
 Mount the NAS or set `KITCHEN_BOX_MANIFEST` to a manifest containing the

@@ -25,6 +25,8 @@ module Kitchen
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
 
+      UUID_PATTERN = /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/
+
       include Box::Source
 
       def create(state)
@@ -55,13 +57,51 @@ module Kitchen
         release_box_source(state)
       end
 
+      def restore_snapshot(snapshot)
+        snapshot = snapshot.to_s.downcase
+        raise ActionFailed, "Provide a VirtualBox snapshot UUID" unless UUID_PATTERN.match?(snapshot)
+
+        state = StateFile.new(config[:kitchen_root], instance.name).read
+        uuid = state[:virtualbox_uuid]
+        unless uuid.is_a?(String) && UUID_PATTERN.match?(uuid) && state[:virtualbox_token]
+          raise ActionFailed, "No Kitchen-managed VirtualBox VM recorded for #{instance.name}"
+        end
+
+        info = vm_info(uuid)
+        unless info["UUID"] == uuid && info["name"] == vm_name(state) && managed_config_path?(state, info["CfgFile"])
+          raise ActionFailed, "Could not verify the Kitchen-managed VirtualBox VM for #{instance.name}"
+        end
+        raise ActionFailed, "The managed VirtualBox VM must be powered off before restoring a snapshot" unless info["VMState"] == "poweroff"
+
+        snapshots = vbox("snapshot", uuid, "list", "--machinereadable")
+        unless snapshots.each_line.any? { |line| /\ASnapshotUUID(?:-[0-9]+)*="#{snapshot}"\s*\z/i.match?(line) }
+          raise ActionFailed, "Snapshot does not exist on #{instance.name}: #{snapshot}"
+        end
+
+        vbox("snapshot", uuid, "restore", snapshot)
+      end
+
       private
+
+      def managed_config_path?(state, path)
+        return false unless path && File.file?(path)
+
+        directory = vm_directory(state)
+        expected = File.join(File.realpath(config[:kitchen_root]), ".kitchen", File.basename(directory))
+        File.realpath(directory) == expected && File.realpath(path).start_with?("#{expected}#{File::SEPARATOR}")
+      rescue SystemCallError
+        false
+      end
+
+      def vm_name(state)
+        "kitchen-#{instance.name}-#{state.fetch(:virtualbox_token)}"
+      end
 
       def prepare_state(state)
         return if state[:virtualbox_token]
 
         state[:virtualbox_token] = SecureRandom.uuid
-        state[:virtualbox_name] = "kitchen-#{instance.name}-#{state[:virtualbox_token]}"
+        state[:virtualbox_name] = vm_name(state)
         checkpoint(state)
       end
 
@@ -71,7 +111,7 @@ module Kitchen
 
       def vm_directory(state)
         token = state.fetch(:virtualbox_token)
-        unless /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/.match?(token)
+        unless token.is_a?(String) && UUID_PATTERN.match?(token)
           raise ActionFailed, "Invalid VirtualBox instance ID in Kitchen state"
         end
 
@@ -121,8 +161,8 @@ module Kitchen
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
-          forwarding.each do |rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{rule.split(",").first}")
+          forwarding.each do |existing_rule|
+            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{existing_rule.split(",").first}")
           end
           TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
           vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}")
