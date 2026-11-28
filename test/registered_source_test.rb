@@ -8,6 +8,7 @@ require "open3"
 require "rbconfig"
 require "socket"
 require "tmpdir"
+require "yaml"
 
 class RegisteredSourceTest < Minitest::Test
   SOURCE = "11111111-1111-4111-8111-111111111111".freeze
@@ -117,6 +118,20 @@ class RegisteredSourceTest < Minitest::Test
     assert_match(/must be powered off.*running/i, output)
     assert_kitchen "destroy"
     assert_equal({ SOURCE => { "name" => "Disposable source", "state" => "running" } }, registry)
+  end
+
+  def test_existing_full_clone_does_not_silently_become_linked
+    assert_kitchen "create"
+    state_path = File.join(@root, ".kitchen", "default-virtualbox.yml")
+    state = YAML.safe_load_file(state_path, permitted_classes: [Symbol])
+    state.delete("virtualbox_clone_request")
+    File.write(state_path, YAML.dump(state))
+    File.write(@configuration, File.read(@configuration).sub("source_vm: Disposable source",
+      "source_vm: Disposable source\n  source_snapshot: clean template"))
+
+    output, status = kitchen("create")
+    refute status.success?, output
+    assert_match(/Run kitchen destroy before recreating/, output)
   end
 
   def test_destroy_preserves_a_replacement_clone_configuration

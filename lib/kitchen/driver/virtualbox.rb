@@ -70,11 +70,7 @@ module Kitchen
         validate_hardware
         source = config[:source_vm]
         snapshot = config[:source_snapshot]
-        unless snapshot.nil? || (snapshot.is_a?(String) && !snapshot.strip.empty? && source && config[:box].nil?)
-          raise ActionFailed, "Set driver.source_snapshot to an existing snapshot name or UUID with driver.source_vm and without driver.box"
-        end
-
-        validate_source_vm(source)
+        validate_clone_source(source, snapshot)
         size = config[:disk_size_mib]
         unless size.nil? || (size.is_a?(Integer) && size > 0)
           raise ActionFailed, "VirtualBox driver.disk_size_mib must be a positive integer"
@@ -520,8 +516,16 @@ module Kitchen
 
       def validate_vm_source
         source = config[:source_vm]
-        validate_source_vm(source)
+        validate_clone_source(source, config[:source_snapshot])
         source.nil? ? validate_box : powered_off_source_uuid(source)
+      end
+
+      def validate_clone_source(source, snapshot)
+        unless snapshot.nil? || (snapshot.is_a?(String) && !snapshot.strip.empty? && source && config[:box].nil?)
+          raise ActionFailed, "Set driver.source_snapshot to an existing snapshot name or UUID with driver.source_vm and without driver.box"
+        end
+
+        validate_source_vm(source)
       end
 
       def validate_source_vm(source)
@@ -745,7 +749,9 @@ module Kitchen
 
       def verify_clone_request(source, snapshot, state)
         previous = state[:virtualbox_clone_request]
-        if state[:virtualbox_destroying] || (previous && previous != [source, snapshot])
+        legacy_full_clone = !previous && state.key?(:virtualbox_media_identities) &&
+          state[:virtualbox_token] == state[:virtualbox_uuid]
+        if state[:virtualbox_destroying] || (previous && previous != [source, snapshot]) || (legacy_full_clone && snapshot)
           raise ActionFailed, "Run kitchen destroy before recreating the VirtualBox instance with this configuration"
         end
       end
