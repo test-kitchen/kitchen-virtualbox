@@ -1,5 +1,7 @@
 ---
 extends: default
-ignore: examples/apache2/kitchen.yml
+ignore:
+  - examples/apache2/kitchen.yml
+  - examples/windows/kitchen.yml
 rules:
   line-length: disable

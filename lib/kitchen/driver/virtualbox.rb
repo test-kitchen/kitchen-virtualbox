@@ -33,7 +33,7 @@ module Kitchen
         state[:virtualbox_uuid] = uuid
         checkpoint(state)
         ensure_running(uuid, state)
-        configure_ssh(uuid, state)
+        configure_ssh(uuid, state) unless winrm?
         instance.transport.connection(state).wait_until_ready
       end
 
@@ -114,21 +114,35 @@ module Kitchen
 
       def ensure_running(uuid, state)
         info = vm_info(uuid)
+        winrm = winrm?
+        if winrm && info.any? { |key, value| /\Anic(?:[2-9]|[1-9]\d+)\z/.match?(key) && value != "none" }
+          raise ActionFailed, "VirtualBox WinRM requires a box with only its first network adapter enabled"
+        end
+
+        rule_name = winrm ? "kitchen-winrm" : "kitchen-ssh"
+        guest_port = instance.transport[:port] || 22
+        rule_prefix = "#{rule_name},tcp,127.0.0.1,"
         forwarding = info.select { |key, _| key.start_with?("Forwarding(") }.values
         if info.fetch("VMState") == "running"
-          rule = forwarding.find { |value| value.start_with?("kitchen-ssh,tcp,127.0.0.1,") }
-          raise ActionFailed, "Running VirtualBox VM is missing its Kitchen SSH forwarding rule" unless rule
+          rule = forwarding.find { |value| value.start_with?(rule_prefix) }
+          unless rule && (!winrm || rule.end_with?(",,#{guest_port}"))
+            raise ActionFailed, "Running VirtualBox VM is missing its #{rule_name} forwarding rule for the configured transport. Run kitchen destroy before changing the transport or its guest port."
+          end
 
           state[:port] = Integer(rule.split(",").fetch(3))
         else
-          forwarding.each do |rule|
-            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{rule.split(",").first}")
+          forwarding.each do |imported_rule|
+            vbox("modifyvm", uuid, "--nat-pf1", "delete=#{imported_rule.split(",").first}")
           end
           TCPServer.open("127.0.0.1", 0) { |socket| state[:port] = socket.addr[1] }
-          vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "kitchen-ssh,tcp,127.0.0.1,#{state[:port]},,#{instance.transport[:port] || 22}")
+          vbox("modifyvm", uuid, "--nic1", "nat", "--nat-pf1", "#{rule_prefix}#{state[:port]},,#{guest_port}")
           vbox("startvm", uuid, "--type", "headless")
         end
         state[:hostname] = "127.0.0.1"
+      end
+
+      def winrm?
+        defined?(Kitchen::Transport::Winrm) && instance.transport.is_a?(Kitchen::Transport::Winrm)
       end
 
       def configure_ssh(uuid, state)
