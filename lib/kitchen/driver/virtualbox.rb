@@ -23,12 +23,19 @@ module Kitchen
       default_config :box
       default_config :box_manifest
       default_config :box_cache
+      default_config :cpus
+      default_config :memory
       default_config :vboxmanage, "VBoxManage"
       default_config :insert_key, true
+
+      # VBoxManage's guest limits on the 64-bit hosts supported by VirtualBox 7.2.
+      HARDWARE_LIMITS = { cpus: (1..64), memory: (4..2_097_152) }.freeze
+      private_constant :HARDWARE_LIMITS
 
       include Box::Source
 
       def create(state)
+        validate_hardware
         prepare_state(state)
         uuid = registered_uuid(state) || import_vm(state)
         state[:virtualbox_uuid] = uuid
@@ -87,6 +94,21 @@ module Kitchen
       end
 
       private
+
+      def validate_hardware
+        HARDWARE_LIMITS.each do |setting, range|
+          value = config[setting]
+          next if value.nil?
+
+          unless value.is_a?(Integer) && value > 0
+            raise ActionFailed, "driver.#{setting} must be a positive integer"
+          end
+
+          unless range.cover?(value)
+            raise ActionFailed, "driver.#{setting} must be within VirtualBox's supported range (#{range})"
+          end
+        end
+      end
 
       def status_report(live, state, message, id = nil)
         { live: live, state: state, source: "driver", resource_id: id,
@@ -162,7 +184,10 @@ module Kitchen
             raise ActionFailed, "VirtualBox box is missing a regular box.ovf: #{source}"
           end
 
-          vbox("import", appliance, "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory)
+          hardware = HARDWARE_LIMITS.keys.flat_map do |setting|
+            config[setting] ? ["--#{setting}", config[setting].to_s] : []
+          end
+          vbox("import", appliance, "--vsys", "0", "--vmname", state.fetch(:virtualbox_name), "--basefolder", directory, *hardware)
         end
         registered_uuid(state) || raise(ActionFailed, "VirtualBox did not register #{state[:virtualbox_name]}")
       rescue Box::LocalArchive::InvalidBox => e
