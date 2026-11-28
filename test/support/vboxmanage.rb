@@ -10,9 +10,9 @@ uuid = registry.key?(target) ? target : registry.find { |_, vm| vm.fetch("name")
 
 case command
 when "list"
-  abort "unexpected list target" unless target == "vms"
+  abort "unexpected list target" unless %w{vms hdds}.include?(target)
 
-  registry.each { |id, vm| puts %("#{vm.fetch("name")}" {#{id}}) }
+  registry.each { |id, vm| puts %("#{vm.fetch("name")}" {#{id}}) } if target == "vms"
 when "showvminfo"
   vm = registry.fetch(uuid)
   puts %{UUID="#{uuid}"}
@@ -87,6 +87,10 @@ when "startvm"
   registry.fetch(uuid)["state"] = "running"
 when "controlvm"
   registry.fetch(uuid)["state"] = "poweroff"
+when "snapshot"
+  abort "unexpected snapshot operation" unless uuid && options == %w{list --machinereadable}
+
+  puts "This machine does not have any snapshots"
 when "unregistervm"
   registry.delete(uuid)
 else
