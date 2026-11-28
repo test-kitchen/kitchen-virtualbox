@@ -127,7 +127,28 @@ module Kitchen
           references.all? { |file| valid_export_file?(appliance, file) }
         raise ActionFailed, "VirtualBox export is missing disk or firmware data" unless valid
 
+        refuse_host_bound_appliance_settings(document)
         files
+      end
+
+      def refuse_host_bound_appliance_settings(document)
+        machines = REXML::XPath.match(document, "//vbox:Machine", "vbox" => "http://www.virtualbox.org/ovf/machine")
+        machines.each do |machine|
+          ports = machine.elements.to_a("Hardware/UART/Port")
+          if ports.any? { |port| !port.attributes["path"].to_s.empty? || %w{RawFile HostPipe HostDevice TCP}.include?(port.attributes["hostMode"]) }
+            raise ActionFailed, "Remove VirtualBox host-connected serial port settings before packaging the VM"
+          end
+
+          tpm = machine.elements["Hardware/TrustedPlatformModule"]
+          if tpm && (%w{Host Swtpm}.include?(tpm.attributes["type"]) || !tpm.attributes["location"].to_s.empty?)
+            raise ActionFailed, "Remove VirtualBox host TPM or external TPM settings before packaging the VM"
+          end
+
+          logos = machine.elements.to_a("Hardware/Firmware/Logo | Hardware/BIOS/Logo")
+          if logos.any? { |logo| !logo.attributes["imagePath"].to_s.empty? }
+            raise ActionFailed, "Remove the VirtualBox custom firmware logo before packaging the VM"
+          end
+        end
       end
 
       def valid_export_file?(appliance, reference)

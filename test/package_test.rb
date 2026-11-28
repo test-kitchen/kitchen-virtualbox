@@ -111,13 +111,43 @@ class PackageTest < Minitest::Test
     assert_empty(Dir.glob(File.join(@root, ".virtualbox-package-*")))
   end
 
+  def test_refuses_host_bound_settings_in_the_export
+    hardware = nil
+    mock_export { |appliance| write_appliance(appliance, hardware: hardware) }
+    {
+      "serial port" => '<UART><Port enabled="false" hostMode="RawFile" path="/tmp/serial.log"/></UART>',
+      "external TPM" => '<TrustedPlatformModule type="Swtpm" location="/tmp/tpm.sock"/>',
+      "host TPM" => '<TrustedPlatformModule type="Host" location=""/>',
+      "firmware logo" => '<Firmware><Logo imagePath="/tmp/logo.bmp"/></Firmware>',
+    }.each do |setting, configuration|
+      hardware = configuration
+      assert_refused(@state, /Remove .*#{setting}.* before packaging/)
+      refute_path_exists(@output)
+      assert_empty(Dir.glob(File.join(@root, ".virtualbox-package-*")))
+    end
+  end
+
+  def test_accepts_portable_hardware_in_the_export
+    hardware = <<~XML
+      <TrustedPlatformModule type="v2_0" location=""/>
+      <UART><Port enabled="true" hostMode="Disconnected"/></UART>
+      <Firmware><Logo fadeIn="false"/></Firmware>
+    XML
+    mock_export { |appliance| write_appliance(appliance, hardware: hardware) }
+
+    assert_equal(@output, @driver.package(@state))
+  end
+
   private
 
-  def write_appliance(appliance)
+  def write_appliance(appliance, hardware: "")
     File.write(File.join(File.dirname(appliance), "disk.vmdk"), "exported disk")
     File.write(appliance, <<~XML)
-      <Envelope xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/2">
+      <Envelope xmlns="http://schemas.dmtf.org/ovf/envelope/2"
+                xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/2"
+                xmlns:vbox="http://www.virtualbox.org/ovf/machine">
         <References><File ovf:href="disk.vmdk" ovf:size="13"/></References>
+        <VirtualSystem><vbox:Machine><Hardware>#{hardware}</Hardware></vbox:Machine></VirtualSystem>
       </Envelope>
     XML
   end
