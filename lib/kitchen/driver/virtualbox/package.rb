@@ -12,10 +12,6 @@ module Kitchen
           raise ActionFailed, "Create the Kitchen instance before packaging it"
         end
 
-        if state[:virtualbox_uuid] == state[:virtualbox_token]
-          raise ActionFailed, "Packaging requires a VM imported from a box. Create an instance with driver.box."
-        end
-
         refuse_injected_key(state)
         output = File.join(config[:kitchen_root], "#{instance.name}.box")
         raise ActionFailed, "Package already exists: #{output}" if File.exist?(output) || File.symlink?(output)
@@ -54,7 +50,7 @@ module Kitchen
         if state[:virtualbox_generated_key] || state[:virtualbox_key_injected] || key_file_present?(state) ||
             File.symlink?(history) || !File.file?(history) || File.read(history, 37) != state[:virtualbox_uuid]
           raise ActionFailed, "Cannot safely remove the Kitchen-injected SSH key from a stopped VM. " \
-            "Create a fresh instance with driver.insert_key disabled and supply your own SSH credentials."
+            "Import a fresh instance with driver.box and driver.insert_key disabled, and supply your own SSH credentials."
         end
       end
 
